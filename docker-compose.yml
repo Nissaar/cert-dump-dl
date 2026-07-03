@@ -1,0 +1,7 @@
+services:
+  exam-studio:
+    build: .
+    volumes:
+      - ./output:/app/output
+    # Override command at runtime:
+    # docker compose run exam-studio -p microsoft -s az-104 -c -f all
