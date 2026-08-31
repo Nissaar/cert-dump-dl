@@ -247,7 +247,7 @@ HTML_TEMPLATE = Template('''\
 {% for q in questions %}
 <div class="qcard" id="q{{ loop.index }}" data-idx="{{ loop.index }}"
      data-answer="{{ q.answer|default('',true)|upper }}"
-     data-topic="{{ q.topic }}"
+     data-topic="{{ q.topic_tags | join(',') if q.topic_tags else q.topic }}"
      data-domain="{{ q.domain|default('',true) }}"
      data-has-discussion="{{ 'true' if q.comments else 'false' }}"
      data-search="{{ (q.title or '')|lower }} {{ (q.content or '')|lower }}">
@@ -481,7 +481,11 @@ function initFilters() {
   document.querySelectorAll(".qcard").forEach(card => {
     const topic = card.dataset.topic;
     const domain = card.dataset.domain;
-    if (topic && topic !== "0" && topic !== "") topics.add(topic);
+
+    if (topic && topic !== "0" && topic !== "") {
+      topic.split(',').forEach(t => topics.add(t.trim()));
+    }
+
     if (domain) domains.add(domain);
   });
 
@@ -490,10 +494,10 @@ function initFilters() {
   if (topics.size === 0) {
     topicFilter.style.display = 'none';
   } else {
-    Array.from(topics).sort((a,b) => a.localeCompare(b, undefined, {numeric: true})).forEach(t => {
+    Array.from(topics).sort().forEach(t => {
       const opt = document.createElement("option");
       opt.value = t;
-      opt.textContent = "Topic " + t;
+      opt.textContent = t; // we no longer prefix with "Topic " since they are string tags like "IAM"
       topicFilter.appendChild(opt);
     });
   }
@@ -521,7 +525,10 @@ function applyFilters() {
 
   document.querySelectorAll(".qcard").forEach(card => {
     const matchSearch = card.dataset.search.includes(q);
-    const matchTopic = t === "" || card.dataset.topic === t;
+
+    const cardTopics = card.dataset.topic ? card.dataset.topic.split(',').map(x => x.trim()) : [];
+    const matchTopic = t === "" || cardTopics.includes(t);
+
     const matchDomain = d === "" || card.dataset.domain === d;
 
     let matchStatus = true;
