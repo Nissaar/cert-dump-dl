@@ -112,6 +112,15 @@ HTML_TEMPLATE = Template('''\
   .choice-text { flex: 1; }
   .choice-text img { max-width: 100%; border-radius: 4px; margin-top: 0.3rem; }
 
+  /* ── Select Dropdowns ── */
+  .select-box {
+    background: var(--card); color: var(--text);
+    border: 1px solid var(--border); padding: 0.45rem 0.8rem;
+    border-radius: 6px; font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .select-box:focus { outline: none; border-color: var(--accent); }
+
   /* ── Reveal ── */
   .reveal-btn {
     background: linear-gradient(135deg, var(--accent), var(--accent2));
@@ -132,17 +141,36 @@ HTML_TEMPLATE = Template('''\
   .voted-label b { color: var(--accent2); }
 
   /* ── Discussion ── */
-  .disc-btn {
-    background: none; border: 1px solid var(--border); color: var(--text-muted);
-    padding: 0.35rem 0.9rem; border-radius: 6px; cursor: pointer;
-    font-size: 0.78rem; margin-top: 0.6rem; transition: all 0.2s;
+  .disc-details {
+    margin-top: 0.6rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    overflow: hidden;
   }
-  .disc-btn:hover { border-color: var(--accent); color: var(--text); }
+  .disc-summary {
+    background: var(--surface); color: var(--text-muted);
+    padding: 0.5rem 0.9rem; cursor: pointer;
+    font-size: 0.78rem; transition: all 0.2s;
+    user-select: none;
+    list-style: none; /* Hide default triangle in many browsers */
+  }
+  /* Webkit custom triangle */
+  .disc-summary::-webkit-details-marker { display: none; }
+  .disc-summary:hover { color: var(--text); background: var(--card); }
+  .disc-summary::before {
+    content: "▶";
+    display: inline-block;
+    margin-right: 0.4rem;
+    transition: transform 0.2s;
+    font-size: 0.7rem;
+  }
+  .disc-details[open] .disc-summary::before {
+    transform: rotate(90deg);
+  }
   .disc-box {
-    display: none; margin-top: 0.6rem; max-height: 400px; overflow-y: auto;
-    border-radius: 8px; border: 1px solid var(--border);
+    max-height: 400px; overflow-y: auto;
+    border-top: 1px solid var(--border);
   }
-  .disc-box.visible { display: block; animation: fadeIn 0.3s; }
 
   .comment {
     padding: 0.7rem 1rem; border-bottom: 1px solid var(--border);
@@ -189,10 +217,29 @@ HTML_TEMPLATE = Template('''\
 <div class="controls">
   <button class="btn" onclick="revealAll()">👁 Reveal All</button>
   <button class="btn" onclick="hideAll()">🙈 Hide All</button>
-  <button class="btn" onclick="scrollToNext()">⏭ Next</button>
-  <input type="text" class="search-box" placeholder="🔍 Filter questions..." oninput="filterQ(this.value)">
+  <button class="btn" onclick="resetProgress()">🔄 Reset</button>
+  <button class="btn" onclick="toggleTheme()">🌗 Theme</button>
+
+  <select class="select-box" id="topicFilter" onchange="applyFilters()">
+    <option value="">All Topics</option>
+  </select>
+  <select class="select-box" id="domainFilter" onchange="applyFilters()">
+    <option value="">All Domains</option>
+  </select>
+  <select class="select-box" id="statusFilter" onchange="applyFilters()">
+    <option value="">All Status</option>
+    <option value="unanswered">Unanswered</option>
+    <option value="correct">Correct</option>
+    <option value="wrong">Wrong</option>
+  </select>
+  <select class="select-box" id="discussionFilter" onchange="applyFilters()">
+    <option value="">All Questions</option>
+    <option value="has_discussion">Has Discussion</option>
+  </select>
+
+  <input type="text" class="search-box" id="searchFilter" placeholder="🔍 Filter questions..." oninput="applyFilters()">
   <span style="font-size:0.72rem;color:var(--text-muted);">
-    <span class="kbd">R</span> Reveal &nbsp; <span class="kbd">↓</span> Next
+    <span class="kbd">R</span> Reveal &nbsp; <span class="kbd">↓</span> Next &nbsp; <span class="kbd">↑</span> Prev &nbsp; <span class="kbd">T</span> Theme
   </span>
 </div>
 
@@ -200,6 +247,9 @@ HTML_TEMPLATE = Template('''\
 {% for q in questions %}
 <div class="qcard" id="q{{ loop.index }}" data-idx="{{ loop.index }}"
      data-answer="{{ q.answer|default('',true)|upper }}"
+     data-topic="{{ q.topic|default('',true) }}"
+     data-domain="{{ q.domain|default('',true) }}"
+     data-has-discussion="{{ 'true' if q.comments else 'false' }}"
      data-search="{{ (q.title or '')|lower }} {{ (q.content or '')|lower }}">
 
   <div class="q-head">
@@ -256,23 +306,25 @@ HTML_TEMPLATE = Template('''\
 
   {# ── Discussion ── #}
   {% if q.comments %}
-  <button class="disc-btn" onclick="toggleDisc({{ loop.index }})">
-    💬 Discussion ({{ q.comments|length }} comment{{ 's' if q.comments|length != 1 }}) — click to expand
-  </button>
-  <div class="disc-box" id="disc{{ loop.index }}">
-    {% for c in q.comments %}
-    <div class="comment">
-      <div class="comment-header">
-        <span>
-          <span class="comment-author">{{ c.author or 'Anonymous' }}</span>
-          {% if c.upvotes %}<span class="comment-votes">▲ {{ c.upvotes }}</span>{% endif %}
-        </span>
-        <span class="comment-date">{{ c.date or '' }}</span>
+  <details class="disc-details" id="disc{{ loop.index }}">
+    <summary class="disc-summary">
+      💬 Discussion ({{ q.comments|length }} comment{{ 's' if q.comments|length != 1 }})
+    </summary>
+    <div class="disc-box">
+      {% for c in q.comments %}
+      <div class="comment">
+        <div class="comment-header">
+          <span>
+            <span class="comment-author">{{ c.author or 'Anonymous' }}</span>
+            {% if c.upvotes %}<span class="comment-votes">▲ {{ c.upvotes }}</span>{% endif %}
+          </span>
+          <span class="comment-date">{{ c.date or '' }}</span>
+        </div>
+        <div class="comment-body">{{ c.text }}</div>
       </div>
-      <div class="comment-body">{{ c.text }}</div>
+      {% endfor %}
     </div>
-    {% endfor %}
-  </div>
+  </details>
   {% endif %}
 
 </div>
@@ -362,8 +414,42 @@ function recalcScore() {
   });
 }
 
-function toggleDisc(idx) {
-  document.getElementById("disc" + idx).classList.toggle("visible");
+function resetProgress() {
+  if (!confirm("Are you sure you want to reset your progress and clear all answers?")) return;
+
+  document.querySelectorAll(".qcard").forEach(card => {
+    const idx = parseInt(card.dataset.idx);
+
+    // Hide answer block
+    const block = document.getElementById("ans" + idx);
+    if (block) block.classList.remove("visible");
+
+    // Remove choice styling
+    const choices = document.querySelectorAll("#choices" + idx + " .choice");
+    choices.forEach(c => {
+      c.classList.remove("selected", "correct-show", "wrong-show");
+    });
+
+    // Remove card styling
+    card.classList.remove("answered-correct", "answered-wrong");
+
+    // Close discussion if open
+    const disc = document.getElementById("disc" + idx);
+    if (disc) disc.removeAttribute("open");
+  });
+
+  revealed.clear();
+  correct = 0;
+  attempted = 0;
+  updateStats();
+  applyFilters();
+}
+
+function toggleTheme() {
+  const html = document.documentElement;
+  const currentTheme = html.getAttribute('data-theme');
+  const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', newTheme);
 }
 
 function revealAll() {
@@ -388,11 +474,77 @@ function scrollToNext() {
   }
 }
 
-function filterQ(query) {
-  const q = query.toLowerCase();
+function initFilters() {
+  const topics = new Set();
+  const domains = new Set();
+
   document.querySelectorAll(".qcard").forEach(card => {
-    card.style.display = card.dataset.search.includes(q) ? "" : "none";
+    const topic = card.dataset.topic;
+    const domain = card.dataset.domain;
+    if (topic && topic !== "0") topics.add(topic);
+    if (domain) domains.add(domain);
   });
+
+  const topicFilter = document.getElementById("topicFilter");
+  Array.from(topics).sort((a,b) => a.localeCompare(b, undefined, {numeric: true})).forEach(t => {
+    const opt = document.createElement("option");
+    opt.value = t;
+    opt.textContent = "Topic " + t;
+    topicFilter.appendChild(opt);
+  });
+
+  const domainFilter = document.getElementById("domainFilter");
+  if (domains.size === 0) {
+    domainFilter.style.display = 'none';
+  } else {
+    Array.from(domains).sort().forEach(d => {
+      const opt = document.createElement("option");
+      opt.value = d;
+      opt.textContent = d;
+      domainFilter.appendChild(opt);
+    });
+  }
+}
+
+function applyFilters() {
+  const q = document.getElementById("searchFilter").value.toLowerCase();
+  const t = document.getElementById("topicFilter").value;
+  const d = document.getElementById("domainFilter").value;
+  const s = document.getElementById("statusFilter").value;
+  const c = document.getElementById("discussionFilter").value;
+
+  document.querySelectorAll(".qcard").forEach(card => {
+    const matchSearch = card.dataset.search.includes(q);
+    const matchTopic = t === "" || card.dataset.topic === t;
+    const matchDomain = d === "" || card.dataset.domain === d;
+
+    let matchStatus = true;
+    if (s === "unanswered") matchStatus = !revealed.has(parseInt(card.dataset.idx));
+    else if (s === "correct") matchStatus = card.classList.contains("answered-correct");
+    else if (s === "wrong") matchStatus = card.classList.contains("answered-wrong");
+
+    let matchDiscussion = true;
+    if (c === "has_discussion") matchDiscussion = card.dataset.hasDiscussion === "true";
+
+    card.style.display = (matchSearch && matchTopic && matchDomain && matchStatus && matchDiscussion) ? "" : "none";
+  });
+}
+
+document.addEventListener("DOMContentLoaded", initFilters);
+
+function scrollToPrev() {
+  const cards = Array.from(document.querySelectorAll(".qcard"));
+  for (let i = cards.length - 1; i >= 0; i--) {
+    const card = cards[i];
+    const r = card.getBoundingClientRect();
+    // Find the first card that is above the current viewport view
+    if (r.bottom < 0 && card.style.display !== "none") {
+      card.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
+  }
+  // Fallback if at top or none found
+  window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
 // Keyboard shortcuts
@@ -409,6 +561,8 @@ document.addEventListener("keydown", e => {
     }
   }
   if (e.key === "ArrowDown") { e.preventDefault(); scrollToNext(); }
+  if (e.key === "ArrowUp") { e.preventDefault(); scrollToPrev(); }
+  if (e.key === "t" || e.key === "T") { toggleTheme(); }
 });
 </script>
 </body>
