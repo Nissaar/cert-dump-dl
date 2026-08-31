@@ -325,6 +325,12 @@ HTML_TEMPLATE = Template('''\
       {% endfor %}
     </div>
   </details>
+  {% else %}
+  <details class="disc-details" id="disc{{ loop.index }}">
+    <summary class="disc-summary" style="opacity: 0.6; cursor: default;" onclick="event.preventDefault()">
+      💬 Discussion (Not scraped or unavailable)
+    </summary>
+  </details>
   {% endif %}
 
 </div>
