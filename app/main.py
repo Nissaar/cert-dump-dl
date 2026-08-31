@@ -28,10 +28,47 @@ OUTPUT_DIR = Path("/app/output")
 #  DATA NORMALIZATION
 # ─────────────────────────────────────────────
 
+
+def infer_tags(q: dict) -> dict:
+    text = (q.get("content", "") + " " + " ".join([c.get("text", "") for c in q.get("choices", [])])).lower()
+
+    # Infer topics
+    topics = set()
+    if "iam" in text or "identity" in text or "role" in text or "permission" in text or "active directory" in text:
+        topics.add("IAM & Security")
+    if "s3" in text or "ebs" in text or "efs" in text or "storage" in text or "glacier" in text:
+        topics.add("Storage")
+    if "vpc" in text or "subnet" in text or "route" in text or "gateway" in text or "network" in text or "cloudfront" in text:
+        topics.add("Networking")
+    if "ec2" in text or "lambda" in text or "compute" in text or "ecs" in text or "fargate" in text:
+        topics.add("Compute")
+    if "rds" in text or "dynamodb" in text or "database" in text or "aurora" in text or "redshift" in text:
+        topics.add("Database")
+    if "sqs" in text or "sns" in text or "decouple" in text or "eventbridge" in text or "kinesis" in text:
+        topics.add("Integration")
+
+    q["topic_tags"] = list(topics) if topics else ["General"]
+
+    # Infer domains (Domain 1, 2, 3, 4) - just basic heuristics
+    if "design" in text and "architecture" in text or "resilient" in text:
+        q["domain"] = "Domain 1"
+    elif "perform" in text or "speed" in text or "latency" in text:
+        q["domain"] = "Domain 2"
+    elif "secur" in text or "access" in text or "protect" in text:
+        q["domain"] = "Domain 3"
+    elif "cost" in text or "cheap" in text or "bill" in text:
+        q["domain"] = "Domain 4"
+    else:
+        # Pseudo-random fallback based on content length for distribution
+        fallback = (len(text) % 4) + 1
+        q["domain"] = f"Domain {fallback}"
+
+    return q
+
 def normalize_question(q: dict, index: int) -> dict:
     """Normalize question into consistent structure for generators."""
     if isinstance(q.get("choices"), list) and q["choices"] and isinstance(q["choices"][0], dict):
-        return q
+        return infer_tags(q)
 
     choices = q.get("choices", [])
 
@@ -71,7 +108,7 @@ def normalize_question(q: dict, index: int) -> dict:
     elif isinstance(comments, list) and comments and isinstance(comments[0], str):
         comments = [{"author": "Anonymous", "date": "", "text": c, "upvotes": 0} for c in comments if c.strip()]
 
-    return {
+    normalized = {
         "title": q.get("title", f"Question {index}"),
         "topic": q.get("topic", 0),
         "question_number": q.get("question_number", index),
@@ -84,6 +121,7 @@ def normalize_question(q: dict, index: int) -> dict:
         "question_link": q.get("question_link", ""),
         "comments": comments,
     }
+    return infer_tags(normalized)
 
 
 # ─────────────────────────────────────────────
