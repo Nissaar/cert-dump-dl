@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+output/
+!output/amazon_clf-c02.html
+!output/amazon_clf-c02.json
+!output/amazon_saa-c03.html
+!output/amazon_saa-c03.json
+!output/microsoft_az-400.html
+!output/microsoft_az-400.json

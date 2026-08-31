@@ -247,7 +247,7 @@ HTML_TEMPLATE = Template('''\
 {% for q in questions %}
 <div class="qcard" id="q{{ loop.index }}" data-idx="{{ loop.index }}"
      data-answer="{{ q.answer|default('',true)|upper }}"
-     data-topic="{{ q.topic|default('',true) }}"
+     data-topic="{{ q.topic }}"
      data-domain="{{ q.domain|default('',true) }}"
      data-has-discussion="{{ 'true' if q.comments else 'false' }}"
      data-search="{{ (q.title or '')|lower }} {{ (q.content or '')|lower }}">
@@ -481,17 +481,23 @@ function initFilters() {
   document.querySelectorAll(".qcard").forEach(card => {
     const topic = card.dataset.topic;
     const domain = card.dataset.domain;
-    if (topic && topic !== "0") topics.add(topic);
+    if (topic && topic !== "0" && topic !== "") topics.add(topic);
     if (domain) domains.add(domain);
   });
 
+
   const topicFilter = document.getElementById("topicFilter");
-  Array.from(topics).sort((a,b) => a.localeCompare(b, undefined, {numeric: true})).forEach(t => {
-    const opt = document.createElement("option");
-    opt.value = t;
-    opt.textContent = "Topic " + t;
-    topicFilter.appendChild(opt);
-  });
+  if (topics.size === 0) {
+    topicFilter.style.display = 'none';
+  } else {
+    Array.from(topics).sort((a,b) => a.localeCompare(b, undefined, {numeric: true})).forEach(t => {
+      const opt = document.createElement("option");
+      opt.value = t;
+      opt.textContent = "Topic " + t;
+      topicFilter.appendChild(opt);
+    });
+  }
+
 
   const domainFilter = document.getElementById("domainFilter");
   if (domains.size === 0) {
