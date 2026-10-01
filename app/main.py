@@ -6,7 +6,9 @@ interactive HTML/MD/PDF with collapsible answers and discussions.
 """
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -18,10 +20,11 @@ from generators.html_generator import generate_html
 from generators.md_generator import generate_markdown
 from generators.pdf_generator import generate_pdf
 from generators.scraper_fallback import ExamTopicsScraper
+from classify import classify, detect_exam_code, detect_provider
 
 console = Console()
 
-OUTPUT_DIR = Path("/app/output")
+OUTPUT_DIR = Path(os.environ.get("EXAM_STUDIO_OUTPUT", "/app/output"))
 
 
 # ─────────────────────────────────────────────
@@ -29,46 +32,95 @@ OUTPUT_DIR = Path("/app/output")
 # ─────────────────────────────────────────────
 
 
-def infer_tags(q: dict) -> dict:
-    text = (q.get("content", "") + " " + " ".join([c.get("text", "") for c in q.get("choices", [])])).lower()
+def content_fingerprint(q: dict) -> str:
+    """Whitespace/punctuation-insensitive key for the question stem."""
+    return re.sub(r"[^a-z0-9]+", "", (q.get("content") or "").lower())
 
-    # Infer topics
-    topics = set()
-    if "iam" in text or "identity" in text or "role" in text or "permission" in text or "active directory" in text:
-        topics.add("IAM & Security")
-    if "s3" in text or "ebs" in text or "efs" in text or "storage" in text or "glacier" in text:
-        topics.add("Storage")
-    if "vpc" in text or "subnet" in text or "route" in text or "gateway" in text or "network" in text or "cloudfront" in text:
-        topics.add("Networking")
-    if "ec2" in text or "lambda" in text or "compute" in text or "ecs" in text or "fargate" in text:
-        topics.add("Compute")
-    if "rds" in text or "dynamodb" in text or "database" in text or "aurora" in text or "redshift" in text:
-        topics.add("Database")
-    if "sqs" in text or "sns" in text or "decouple" in text or "eventbridge" in text or "kinesis" in text:
-        topics.add("Integration")
 
-    q["topic_tags"] = list(topics) if topics else ["General"]
+def question_uid(q: dict) -> str:
+    """Stable ID used by the HTML to persist progress across re-scrapes."""
+    key = content_fingerprint(q) + "|" + "|".join(
+        re.sub(r"[^a-z0-9]+", "", (c.get("text") or "").lower()) for c in q.get("choices", [])
+    )
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
-    # Infer domains (Domain 1, 2, 3, 4) - just basic heuristics
-    if "design" in text and "architecture" in text or "resilient" in text:
-        q["domain"] = "Domain 1"
-    elif "perform" in text or "speed" in text or "latency" in text:
-        q["domain"] = "Domain 2"
-    elif "secur" in text or "access" in text or "protect" in text:
-        q["domain"] = "Domain 3"
-    elif "cost" in text or "cheap" in text or "bill" in text:
-        q["domain"] = "Domain 4"
-    else:
-        # Pseudo-random fallback based on content length for distribution
-        fallback = (len(text) % 4) + 1
-        q["domain"] = f"Domain {fallback}"
 
-    return q
+def dedupe(questions: list[dict]) -> list[dict]:
+    """Drop exact duplicates (same stem + choices), keeping the richest copy."""
+    best: dict[str, dict] = {}
+    order: list[str] = []
+    for q in questions:
+        uid = q["uid"]
+        if uid not in best:
+            best[uid] = q
+            order.append(uid)
+        elif len(q.get("comments") or []) > len(best[uid].get("comments") or []):
+            best[uid] = q
+    if len(order) != len(questions):
+        console.print(f"[yellow]🧹 Removed {len(questions) - len(order)} duplicate questions[/]")
+    return [best[u] for u in order]
+
+
+def merge_with_cache(questions: list[dict], cache_path: Path) -> list[dict]:
+    """
+    ExamTopics no longer exposes the official answer (or structured choices)
+    to anonymous users. Fill any gaps from a previous scrape of the same exam.
+    """
+    if not cache_path.exists():
+        return questions
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        console.print(f"[yellow]⚠ Could not read cache {cache_path}: {e}[/]")
+        return questions
+
+    by_fp: dict[str, dict] = {}
+    for c in cached:
+        fp = content_fingerprint(c)
+        if fp and (fp not in by_fp or (c.get("answer") and not by_fp[fp].get("answer"))):
+            by_fp[fp] = c
+
+    filled = 0
+    seen: set[str] = set()
+    for q in questions:
+        fp = content_fingerprint(q)
+        seen.add(fp)
+        old = by_fp.get(fp)
+        if not old:
+            continue
+        touched = False
+        for field in ("answer", "choices", "images", "voted_answer", "vote_data", "comments"):
+            if not q.get(field) and old.get(field):
+                q[field] = old[field]
+                touched = True
+        filled += touched
+    console.print(f"[cyan]♻ Filled missing data for {filled} questions from cache {cache_path.name}[/]")
+
+    # Keep questions the live scrape missed (rate limits, Cloudflare, removed pages).
+    # Iterate the full cache: different questions can share a stem (different choices).
+    kept = [c for c in cached if content_fingerprint(c) not in seen]
+    if kept:
+        console.print(f"[cyan]♻ Kept {len(kept)} questions from the cache that weren't re-scraped[/]")
+    return questions + kept
+
+
+def finalize(questions: list[dict], exam_code: str, provider: str) -> list[dict]:
+    """Recompute uids (choices may have been filled), dedupe, classify."""
+    for q in questions:
+        q["uid"] = question_uid(q)
+    questions = dedupe(questions)
+    for q in questions:
+        classify(q, exam_code, provider)
+    return questions
+
 
 def normalize_question(q: dict, index: int) -> dict:
     """Normalize question into consistent structure for generators."""
     if isinstance(q.get("choices"), list) and q["choices"] and isinstance(q["choices"][0], dict):
-        return infer_tags(q)
+        q.setdefault("comments", [])
+        q.setdefault("images", [])
+        q["uid"] = question_uid(q)
+        return q
 
     choices = q.get("choices", [])
 
@@ -121,7 +173,8 @@ def normalize_question(q: dict, index: int) -> dict:
         "question_link": q.get("question_link", ""),
         "comments": comments,
     }
-    return infer_tags(normalized)
+    normalized["uid"] = question_uid(normalized)
+    return normalized
 
 
 # ─────────────────────────────────────────────
@@ -162,14 +215,14 @@ def list_exams(provider: str):
 #  SCRAPING
 # ─────────────────────────────────────────────
 
-def run_scraper(provider: str, exam: str, include_comments: bool) -> list[dict]:
+def run_scraper(provider: str, exam: str, include_comments: bool, crawl_index: bool = True) -> list[dict]:
     """Scrape ExamTopics using plain HTTP (no JS = paywall bypass)."""
     console.print(f"\n[bold cyan]⏳ Scraping ExamTopics...[/]")
     console.print(f"   Provider: [yellow]{provider}[/]")
     console.print(f"   Exam:     [yellow]{exam}[/]")
     console.print(f"   Comments: [yellow]{'yes' if include_comments else 'no'}[/]\n")
 
-    scraper = ExamTopicsScraper(provider, exam, include_comments)
+    scraper = ExamTopicsScraper(provider, exam, include_comments, crawl_index)
     data = scraper.scrape_all()
 
     if data:
@@ -241,6 +294,8 @@ Exam codes must match the ExamTopics URL slug (lowercase).
                         help="Color theme for HTML output (default: dark)")
     parser.add_argument("--shuffle", action="store_true",
                         help="Randomize question order")
+    parser.add_argument("--skip-index", action="store_true",
+                        help="Skip the slow live discussion-index crawl (archive discovery only)")
     parser.add_argument("--list-exams", action="store_true",
                         help="List available exams for the provider and exit")
 
@@ -259,25 +314,38 @@ Exam codes must match the ExamTopics URL slug (lowercase).
         parser.print_help()
         sys.exit(1)
 
+    # Output base name (reuse the JSON's name when regenerating from it)
+    if args.output_name:
+        base_name = args.output_name
+    elif args.json and not (args.provider and args.exam):
+        base_name = Path(args.json).stem
+    else:
+        base_name = f"{args.provider}_{args.exam}"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     # Get questions
     if args.json:
         questions = run_from_json(args.json)
     else:
-        questions = run_scraper(args.provider, args.exam, args.comments)
+        questions = run_scraper(args.provider, args.exam, args.comments, not args.skip_index)
+        questions = merge_with_cache(questions, OUTPUT_DIR / f"{base_name}.json")
 
     if not questions:
         console.print("[bold red]No questions found. Exiting.[/]")
         sys.exit(1)
 
-    # Shuffle if requested
+    exam_code = detect_exam_code(questions, args.exam)
+    provider = detect_provider(questions, args.provider)
+    questions = finalize(questions, exam_code, provider)
+    missing = sum(1 for q in questions if not q.get("answer") and not q.get("voted_answer"))
+    if missing:
+        console.print(f"[yellow]⚠ {missing} questions have neither an official nor a community answer[/]")
+
+    # Shuffle if requested (the HTML also has its own shuffle button)
     if args.shuffle:
         import random
         random.shuffle(questions)
         console.print("[yellow]🔀 Questions shuffled[/]")
-
-    # Output base name
-    base_name = args.output_name or f"{args.provider or 'exam'}_{args.exam or 'questions'}"
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Generate outputs
     formats = ["html", "md", "pdf"] if args.format == "all" else [args.format]
@@ -286,7 +354,7 @@ Exam codes must match the ExamTopics URL slug (lowercase).
         try:
             if fmt == "html":
                 out = OUTPUT_DIR / f"{base_name}.html"
-                generate_html(questions, out, theme=args.theme)
+                generate_html(questions, out, theme=args.theme, exam_code=exam_code, provider=provider)
                 console.print(f"[bold green]📄 HTML → {out}[/]")
             elif fmt == "md":
                 out = OUTPUT_DIR / f"{base_name}.md"

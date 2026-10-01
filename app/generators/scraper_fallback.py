@@ -24,16 +24,17 @@ URL patterns:
 """
 
 import base64
+import html
 import json
 import logging
 import re
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -52,21 +53,34 @@ HEADERS = {
 }
 
 BASE_URL = "https://www.examtopics.com"
+ARCHIVE_CDX = "https://web.archive.org/cdx/search/cdx"
+ARCHIVE_WEB = "https://web.archive.org/web"
+ARCHIVE_INTERVAL = 1.0  # seconds between archive.org snapshot fetches
 
-INDEX_RATE_LIMIT = 1.5
-DISC_RATE_LIMIT = 1.5
+# All threads share one pacer: at most one request every BASE_INTERVAL seconds,
+# stretched (up to MAX_INTERVAL) whenever ExamTopics answers 429 / a challenge.
+BASE_INTERVAL = 1.0
+MAX_INTERVAL = 6.0
 INDEX_WORKERS = 3
 DISC_WORKERS = 4
 
 
 class ExamTopicsScraper:
-    def __init__(self, provider: str, exam_code: str, include_comments: bool = True):
+    def __init__(self, provider: str, exam_code: str, include_comments: bool = True,
+                 crawl_index: bool = True):
         self.provider = provider.lower().strip()
         self.exam_code = exam_code.lower().strip()
         self.include_comments = include_comments
         self._image_cache: dict[str, str] = {}
         self._image_lock = threading.Lock()
         self._progress_lock = threading.Lock()
+        self._rate_lock = threading.Lock()
+        self._interval = BASE_INTERVAL
+        self._next_slot = 0.0
+        self._failed_pages: list[int] = []
+        self.crawl_index = crawl_index
+        self._archive_lock = threading.Lock()
+        self._archive_next = 0.0
         self._urls_found = 0
         self._questions_scraped = 0
 
@@ -94,9 +108,18 @@ class ExamTopicsScraper:
         logger.info(f"  Got {len(first_10)} preview questions, {total_expected} total expected\n")
 
         # ── Phase 2 ──
-        logger.info("Phase 2: Crawling discussion index for ALL exam URLs...")
-        logger.info("  (This crawls every page — typically 10-20 minutes)\n")
-        disc_urls = self._crawl_full_discussion_index()
+        # The live discussion index only lists a fraction of an exam's
+        # discussions, so URLs are also discovered from the Internet Archive.
+        logger.info("Phase 2a: Discovering discussion URLs from the Internet Archive...")
+        archive_urls = self._discover_from_archive()
+        logger.info(f"  Archive: {len(archive_urls)} usable discussion URLs\n")
+
+        index_urls: list[str] = []
+        if self.crawl_index:
+            logger.info("Phase 2b: Crawling live discussion index (catches the newest questions)...")
+            logger.info("  (This crawls every page — typically 20-40 minutes; skip with --skip-index)\n")
+            index_urls = self._crawl_full_discussion_index()
+        disc_urls = self._dedupe_by_id(archive_urls + index_urls)
         logger.info(f"\n  Found {len(disc_urls)} discussion URLs total\n")
 
         if not disc_urls and not first_10:
@@ -124,11 +147,14 @@ class ExamTopicsScraper:
             key = self._make_merge_key(q)
             merged[key] = q
 
-        # Sort by topic, then question number
-        result = sorted(
-            merged.values(),
-            key=lambda q: (q.get("topic", 0), q.get("question_number", 0)),
-        )
+        # Sort by topic, then question number; unnumbered ones last, ordered
+        # by discussion id so the order is deterministic across runs
+        def sort_key(q):
+            qn = q.get("question_number", 0)
+            m = re.search(r"/view/(\d+)-", q.get("question_link", ""))
+            return (qn == 0, q.get("topic", 0), qn, int(m.group(1)) if m else 0)
+
+        result = sorted(merged.values(), key=sort_key)
 
         # Re-number sequentially if topic/question numbers are all zero
         all_zero = all(
@@ -261,6 +287,118 @@ class ExamTopicsScraper:
     #  PHASE 2: FULL DISCUSSION INDEX CRAWL
     # ═════════════════════════════════════════════
 
+    # ═════════════════════════════════════════════
+    #  PHASE 2a: ARCHIVE DISCOVERY
+    # ═════════════════════════════════════════════
+
+    _FULL_URL = re.compile(r"/view/(\d+)-exam-(.+?)-topic-(\d+)-question-(\d+)-discussion/?$")
+    _SHORT_URL = re.compile(r"/view/(\d+)-exam-(.+?)/?$")
+
+    def _cdx(self, extra: str) -> list[list[str]]:
+        """Query the Wayback Machine CDX index for this exam's discussion URLs."""
+        url = (f"{ARCHIVE_CDX}?url=examtopics.com/discussions/{self.provider}/view/"
+               f"&matchType=prefix&filter=original:.*{re.escape(self.exam_code)}.*"
+               f"&collapse=urlkey&output=json&limit=200000{extra}")
+        session = self._make_session()
+        for attempt in range(4):
+            try:
+                resp = session.get(url, timeout=180)
+                if resp.status_code == 200:
+                    rows = resp.json() if resp.text.strip() else []
+                    return rows[1:]  # first row is the header
+                logger.warning(f"  Archive CDX HTTP {resp.status_code}, retrying...")
+            except (requests.RequestException, ValueError) as e:
+                logger.warning(f"  Archive CDX error: {e}")
+            time.sleep(10 * (attempt + 1))
+        return []
+
+    def _discover_from_archive(self) -> list[str]:
+        """
+        Full URLs (…-topic-T-question-N-discussion/) are used as-is. Short URLs
+        (…-exam-<slug>/, which the live site now 404s) are resolved to full URLs by
+        reading the question number from one archived copy of the page.
+        """
+        rows = self._cdx("&fl=original")
+        if not rows:
+            logger.warning("  Archive has no URLs for this exam (or is unreachable)")
+            return []
+
+        full: dict[str, str] = {}
+        short: dict[str, str] = {}
+        for (orig,) in rows:
+            path = urlparse(orig).path
+            m = self._FULL_URL.search(path)
+            if m:
+                full[m.group(1)] = f"{BASE_URL}/discussions/{self.provider}{path[path.index('/view/'):]}".rstrip("/") + "/"
+                continue
+            m = self._SHORT_URL.search(path)
+            if m and m.group(1) not in full:
+                short[m.group(1)] = m.group(2)
+        short = {i: slug for i, slug in short.items() if i not in full}
+        logger.info(f"  {len(full)} full URLs, {len(short)} short URLs to resolve")
+
+        if short:
+            snaps = {}
+            for ts, orig in self._cdx("&fl=timestamp,original&filter=statuscode:200"):
+                m = self._SHORT_URL.search(urlparse(orig).path)
+                if m and m.group(1) in short:
+                    snaps[m.group(1)] = (ts, orig)
+            logger.info(f"  {len(snaps)} short URLs have an archived copy — reading question numbers...")
+            resolved = 0
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                futures = {ex.submit(self._resolve_short, i, short[i], *snaps[i]): i for i in snaps}
+                for f in as_completed(futures):
+                    url = f.result()
+                    if url:
+                        full[futures[f]] = url
+                        resolved += 1
+                        if resolved % 50 == 0:
+                            logger.info(f"  Resolved {resolved}/{len(snaps)}...")
+            logger.info(f"  Resolved {resolved} short URLs "
+                        f"({len(short) - resolved} unresolved — the previous JSON covers those)")
+        return list(full.values())
+
+    def _resolve_short(self, disc_id: str, slug: str, ts: str, orig: str) -> str | None:
+        with self._archive_lock:
+            wait = self._archive_next - time.monotonic()
+            self._archive_next = max(time.monotonic(), self._archive_next) + ARCHIVE_INTERVAL
+        if wait > 0:
+            time.sleep(wait)
+        session = self._make_session()
+        for attempt in range(3):
+            try:
+                resp = session.get(f"{ARCHIVE_WEB}/{ts}id_/{orig}", timeout=60)
+                if resp.status_code == 200:
+                    text = resp.text
+                    m = (re.search(r"topic\s+(\d+)\s+question\s+(\d+)\s+discussion", text, re.IGNORECASE)
+                         or re.search(r"Topic\s*#:\s*(\d+).*?Question\s*#:\s*(\d+)", text, re.S))
+                    if not m:
+                        qm = re.search(r"Question\s*#:\s*(\d+)", text)
+                        tm = re.search(r"Topic\s*#:\s*(\d+)", text)
+                        if not qm:
+                            return None
+                        topic, qnum = (tm.group(1) if tm else "1"), qm.group(1)
+                    else:
+                        topic, qnum = m.group(1), m.group(2)
+                    return (f"{BASE_URL}/discussions/{self.provider}/view/{disc_id}-exam-{slug}"
+                            f"-topic-{topic}-question-{qnum}-discussion/")
+                if resp.status_code in (404, 403):
+                    return None
+            except requests.RequestException:
+                pass
+            time.sleep(5 * (attempt + 1))
+        return None
+
+    def _dedupe_by_id(self, urls: list[str]) -> list[str]:
+        """One URL per discussion id, preferring the full (current) URL form."""
+        best: dict[str, str] = {}
+        for u in urls:
+            m = re.search(r"/view/(\d+)-", u)
+            key = m.group(1) if m else u
+            if key not in best or ("-question-" in u and "-question-" not in best[key]):
+                best[key] = u
+        return sorted(best.values())
+
     def _crawl_full_discussion_index(self) -> list[str]:
         session = self._make_session()
         first_url = f"{BASE_URL}/discussions/{self.provider}/"
@@ -307,6 +445,10 @@ class ExamTopicsScraper:
                 except Exception as e:
                     logger.error(f"  Index batch error: {e}")
 
+        if self._failed_pages:
+            logger.warning(f"  ⚠ {len(self._failed_pages)} index pages could not be fetched "
+                           f"(rate limited) — some questions may be missing; "
+                           f"the previous JSON fills the gaps")
         return sorted(all_urls)
 
     def _crawl_index_batch(self, pages: list[int], max_pages: int) -> set[str]:
@@ -315,8 +457,11 @@ class ExamTopicsScraper:
 
         for page_num in pages:
             url = f"{BASE_URL}/discussions/{self.provider}/{page_num}"
-            resp = self._fetch_with_session(session, url, retries=2)
+            resp = self._fetch_with_session(session, url)
 
+            if not resp:
+                with self._progress_lock:
+                    self._failed_pages.append(page_num)
             if resp:
                 soup = BeautifulSoup(resp.text, "html.parser")
                 found = self._extract_exam_links(soup)
@@ -332,7 +477,6 @@ class ExamTopicsScraper:
                         f"{self._urls_found} URLs found so far..."
                     )
 
-            time.sleep(INDEX_RATE_LIMIT)
 
         return results
 
@@ -413,10 +557,8 @@ class ExamTopicsScraper:
         return questions
 
     def _scrape_one_discussion(self, url: str) -> dict | None:
-        time.sleep(DISC_RATE_LIMIT * 0.3)
-
         session = self._make_session()
-        resp = self._fetch_with_session(session, url, retries=2)
+        resp = self._fetch_with_session(session, url)
         if not resp:
             return None
 
@@ -425,15 +567,11 @@ class ExamTopicsScraper:
             return None
 
         card = soup.select_one("div.card.exam-question-card")
-        if not card:
-            for sel in ["div.question-body", "div.card-body"]:
-                card = soup.select_one(sel)
-                if card:
-                    break
-            if not card:
-                return None
-
-        q = self._parse_question_card(card)
+        if card:
+            q = self._parse_question_card(card)
+        else:
+            # Current layout: header container + question-body with inline choices
+            q = self._parse_discussion_question(soup)
         if not q:
             return None
 
@@ -450,11 +588,126 @@ class ExamTopicsScraper:
                 f"topic {topic} question {qnum}"
             )
 
-        # Parse comments
+        # Parse comments (always: the community vote tally is built from them)
+        comments = self._parse_comments(soup)
+        if not q.get("vote_data"):
+            vote_data = self._tally_votes(comments)
+            if vote_data:
+                q["vote_data"] = vote_data
+                q["voted_answer"] = vote_data[0]["voted_answers"]
+        q["discussion_count"] = q.get("discussion_count") or len(comments)
         if self.include_comments:
-            q["comments"] = self._parse_comments(soup)
+            q["comments"] = comments
 
         return q
+
+    @staticmethod
+    def _tally_votes(comments: list[dict]) -> list[dict]:
+        """Community vote from 'Selected Answer' badges, one vote per author."""
+        by_author: dict[str, str] = {}
+        for i, c in enumerate(comments):
+            sel = c.get("selected_answer")
+            if sel:
+                by_author.setdefault(c.get("author") or f"anon{i}", sel)
+        counts: dict[str, int] = {}
+        for sel in by_author.values():
+            counts[sel] = counts.get(sel, 0) + 1
+        ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+        return [
+            {"voted_answers": a, "vote_count": n, "is_most_voted": i == 0}
+            for i, (a, n) in enumerate(ranked)
+        ]
+
+    def _parse_discussion_question(self, soup: BeautifulSoup) -> dict | None:
+        """
+        Parse the current discussion-page layout:
+          div.discussion-header-container
+            "Question #: 7  Topic #: 1"
+            div.question-body[data-id] > p.card-text  (stem + "A. ..." choices inline)
+        """
+        body = soup.select_one("div.discussion-header-container div.question-body") \
+            or soup.select_one("div.question-body")
+        if not body:
+            return None
+        p = body.select_one("p.card-text") or body
+
+        lines, images = self._walk_lines(p)
+        stem_lines: list[str] = []
+        choices: list[dict] = []
+        for line in lines:
+            expected = chr(ord(choices[-1]["letter"]) + 1) if choices else "A"
+            m = re.match(r"^([A-H])\.\s*(.*)$", line)
+            if m and m.group(1) == expected:
+                choices.append({"letter": m.group(1), "text": m.group(2).strip(),
+                                "image": None, "is_correct": False})
+            elif choices:
+                choices[-1]["text"] = (choices[-1]["text"] + "\n" + line).strip()
+            else:
+                stem_lines.append(line)
+
+        topic_num, q_num = 0, 0
+        header = soup.select_one("div.discussion-header-container")
+        if header:
+            ht = header.get_text(" ", strip=True)
+            m = re.search(r"Question\s*#:?\s*(\d+)", ht)
+            if m:
+                q_num = int(m.group(1))
+            m = re.search(r"Topic\s*#:?\s*(\d+)", ht)
+            if m:
+                topic_num = int(m.group(1))
+
+        return {
+            "title": f"Exam {self.exam_code.upper()} topic {topic_num} question {q_num}",
+            "topic": topic_num,
+            "question_number": q_num,
+            "header": "",
+            "content": "\n".join(stem_lines).strip(),
+            "choices": choices,
+            "images": images,
+            "answer": "",
+            "voted_answer": "",
+            "vote_data": [],
+            "question_link": "",
+            "discussion_count": 0,
+            "data_id": body.get("data-id", ""),
+            "comments": [],
+        }
+
+    def _walk_lines(self, el: Tag) -> tuple[list[str], list[dict]]:
+        """
+        Flatten an element into text lines split on <br>, collecting images.
+        Recurses into <br> too: html.parser nests content inside unclosed <br>.
+        """
+        buf: list[str] = []
+        images: list[dict] = []
+
+        def walk(node):
+            for child in node.children:
+                if isinstance(child, NavigableString):
+                    if isinstance(child, Comment):
+                        continue
+                    buf.append(str(child))
+                elif isinstance(child, Tag):
+                    if child.name == "br":
+                        buf.append("\n")
+                        walk(child)
+                    elif child.name == "img":
+                        idata = self._process_image(child)
+                        if idata:
+                            images.append(idata)
+                    elif child.name in ("a",) and "btn" in (child.get("class") or []):
+                        continue
+                    else:
+                        if child.name in ("p", "div", "li"):
+                            buf.append("\n")
+                        walk(child)
+                        if child.name in ("p", "div", "li"):
+                            buf.append("\n")
+
+        walk(el)
+        text = "".join(buf)
+        lines = [re.sub(r"[ \t\r\f\v ]+", " ", ln).strip() for ln in text.split("\n")]
+        return [ln for ln in lines if ln], images
 
     def _extract_topic_question_from_url(self, url: str) -> tuple[int, int]:
         """
@@ -524,7 +777,7 @@ class ExamTopicsScraper:
             p_classes = " ".join(p.get("class", []))
             if "question-answer" in p_classes:
                 continue
-            content = self._element_to_text(p)
+            content = "\n".join(self._walk_lines(p)[0])
             for img in p.find_all("img"):
                 img_data = self._process_image(img)
                 if img_data:
@@ -663,6 +916,10 @@ class ExamTopicsScraper:
         Anchors on .original-comment elements (the actual comment text),
         walks UP the DOM to find metadata.
         """
+        containers = soup.select("div.comment-container")
+        if containers:
+            return self._parse_comment_containers(containers)
+
         comments = []
         original_comments = soup.select(".original-comment")
         if not original_comments:
@@ -765,6 +1022,76 @@ class ExamTopicsScraper:
         )
         return unique
 
+    def _parse_comment_containers(self, containers: list[Tag]) -> list[dict]:
+        """
+        Current layout (one per comment, replies nested in div.comment-replies):
+          div.media.comment-container[data-comment-id]
+            .media-body > div:first  → h5.comment-username, span.comment-date, span.badge (Highly Voted)
+            .media-body > .comment-body → div.badge "Selected Answer: AB", div.comment-content,
+                                          span.upvote-count "12 times"
+        Returned in page order (threads stay together); replies carry parent_id.
+        """
+        comments = []
+        stack: list[tuple[int, str]] = []
+        for cont in containers:
+            body = cont.find("div", class_="media-body", recursive=False)
+            if not body:
+                continue
+            head = body.find("div", recursive=False)
+            cbody = body.find("div", class_="comment-body", recursive=False)
+            content = cbody.find("div", class_="comment-content", recursive=False) if cbody else None
+            if not content:
+                continue
+            text = html.unescape("\n".join(self._walk_lines(content)[0]).strip())
+            if not text:
+                continue
+
+            author_el = head.select_one(".comment-username") if head else None
+            date_el = head.select_one(".comment-date") if head else None
+            badges = [b.get_text(" ", strip=True).lower() for b in head.select(".badge")] if head else []
+            badge = ""
+            if any("highly voted" in b for b in badges):
+                badge = "highly_voted"
+            elif any("most recent" in b for b in badges):
+                badge = "most_recent"
+
+            selected = ""
+            if cbody:
+                for b in cbody.find_all("div", class_="badge", recursive=False):
+                    m = re.search(r"Selected Answer:\s*([A-H]+)", b.get_text(" ", strip=True))
+                    if m:
+                        selected = "".join(sorted(set(m.group(1).upper())))
+                        break
+
+            upvotes = 0
+            up_el = cbody.select_one(".comment-control .upvote-count") if cbody else None
+            if up_el:
+                m = re.search(r"(\d+)", up_el.get_text(strip=True))
+                if m:
+                    upvotes = int(m.group(1))
+
+            # Replies are flat siblings indented by 30px per level
+            m = re.search(r"margin-left:\s*(\d+)px", cont.get("style", ""))
+            depth = int(m.group(1)) // 30 if m else 0
+            while stack and stack[-1][0] >= depth:
+                stack.pop()
+            parent_id = stack[-1][1] if stack else ""
+            cid = cont.get("data-comment-id", "")
+            stack.append((depth, cid))
+            comments.append({
+                "id": cid,
+                "parent_id": parent_id,
+                "depth": depth,
+                "author": (author_el.get_text(strip=True) if author_el else "") or "Anonymous",
+                "date": date_el.get_text(strip=True) if date_el else "",
+                "date_full": date_el.get("title", "") if date_el else "",
+                "text": text[:4000],
+                "upvotes": upvotes,
+                "badge": badge,
+                "selected_answer": selected,
+            })
+        return comments
+
     # ═════════════════════════════════════════════
     #  TEXT / IMAGE HELPERS
     # ═════════════════════════════════════════════
@@ -837,18 +1164,44 @@ class ExamTopicsScraper:
             ]
         )
 
+    def _throttle(self):
+        """Shared pacing across all worker threads (ExamTopics rate-limits per IP)."""
+        with self._rate_lock:
+            now = time.monotonic()
+            slot = max(now, self._next_slot)
+            self._next_slot = slot + self._interval
+        if slot > now:
+            time.sleep(slot - now)
+
+    def _backoff(self, seconds: float):
+        """Slow everyone down after a 429/challenge, then pause this thread."""
+        with self._rate_lock:
+            self._interval = min(self._interval * 1.5, MAX_INTERVAL)
+            self._next_slot = max(self._next_slot, time.monotonic() + seconds)
+        time.sleep(seconds)
+
     def _fetch_with_session(
-        self, session: requests.Session, url: str, retries: int = 3,
+        self, session: requests.Session, url: str, retries: int = 6,
     ) -> requests.Response | None:
         for attempt in range(retries):
+            self._throttle()
             try:
                 resp = session.get(url, timeout=30)
+                if resp.status_code == 200 and self._is_challenge_page(resp.text):
+                    wait = min(15 * 2 ** attempt, 300)
+                    logger.warning(f"  Cloudflare challenge → pausing {wait}s...")
+                    self._backoff(wait)
+                    continue
                 if resp.status_code == 200:
+                    with self._rate_lock:  # recover speed slowly after throttling
+                        self._interval = max(BASE_INTERVAL, self._interval * 0.97)
                     return resp
-                if resp.status_code in (429, 503):
-                    wait = 2 ** (attempt + 2)
-                    logger.warning(f"  HTTP {resp.status_code} → retry in {wait}s...")
-                    time.sleep(wait)
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    retry_after = resp.headers.get("Retry-After", "")
+                    wait = int(retry_after) if retry_after.isdigit() else min(10 * 2 ** attempt, 300)
+                    logger.warning(f"  HTTP {resp.status_code} → pausing {wait}s "
+                                   f"(pace now {self._interval:.1f}s/request)...")
+                    self._backoff(wait)
                     continue
                 if resp.status_code == 404:
                     return None
