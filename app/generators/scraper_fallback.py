@@ -67,7 +67,8 @@ DISC_WORKERS = 4
 
 class ExamTopicsScraper:
     def __init__(self, provider: str, exam_code: str, include_comments: bool = True,
-                 crawl_index: bool = True):
+                 crawl_index: bool = True, resolve_ids: bool = False,
+                 max_probes: int = 120, state_dir: str | None = None):
         self.provider = provider.lower().strip()
         self.exam_code = exam_code.lower().strip()
         self.include_comments = include_comments
@@ -79,6 +80,10 @@ class ExamTopicsScraper:
         self._next_slot = 0.0
         self._failed_pages: list[int] = []
         self.crawl_index = crawl_index
+        self.resolve_ids = resolve_ids
+        self.max_probes = max_probes
+        self.state_dir = state_dir
+        self._unresolved: dict[str, str] = {}
         self._archive_lock = threading.Lock()
         self._archive_next = 0.0
         self._urls_found = 0
@@ -120,6 +125,12 @@ class ExamTopicsScraper:
             logger.info("  (This crawls every page — typically 20-40 minutes; skip with --skip-index)\n")
             index_urls = self._crawl_full_discussion_index()
         disc_urls = self._dedupe_by_id(archive_urls + index_urls)
+        if self.resolve_ids:
+            known = {re.search(r"/view/(\d+)-", u).group(1) for u in disc_urls if "/view/" in u}
+            todo = {i: slug for i, slug in self._unresolved.items() if i not in known}
+            if todo:
+                logger.info(f"\nPhase 2c: Resolving {len(todo)} discussion ids by probing question numbers...")
+                disc_urls = self._dedupe_by_id(disc_urls + self._resolve_by_probing(todo, disc_urls))
         logger.info(f"\n  Found {len(disc_urls)} discussion URLs total\n")
 
         if not disc_urls and not first_10:
@@ -335,13 +346,23 @@ class ExamTopicsScraper:
             if m and m.group(1) not in full:
                 short[m.group(1)] = m.group(2)
         short = {i: slug for i, slug in short.items() if i not in full}
+        self._unresolved = dict(short)
         logger.info(f"  {len(full)} full URLs, {len(short)} short URLs to resolve")
+
+        st = self._load_probe_state()
+        for i, u in st.get("archive", {}).items():
+            if i in short:
+                full[i] = u
+                del short[i]
+        skip = set(st.get("archive_failed", []))
+        if st.get("archive"):
+            logger.info(f"  Reusing {len(st['archive'])} question numbers read from the archive in a previous run")
 
         if short:
             snaps = {}
             for ts, orig in self._cdx("&fl=timestamp,original&filter=statuscode:200"):
                 m = self._SHORT_URL.search(urlparse(orig).path)
-                if m and m.group(1) in short:
+                if m and m.group(1) in short and m.group(1) not in skip:
                     snaps[m.group(1)] = (ts, orig)
             logger.info(f"  {len(snaps)} short URLs have an archived copy — reading question numbers...")
             resolved = 0
@@ -351,11 +372,19 @@ class ExamTopicsScraper:
                     url = f.result()
                     if url:
                         full[futures[f]] = url
+                        st.setdefault("archive", {})[futures[f]] = url
                         resolved += 1
+                    else:
+                        st.setdefault("archive_failed", []).append(futures[f])
+                    if (resolved + len(st.get("archive_failed", []))) % 20 == 0:
+                        self._save_probe_state(st)
                         if resolved % 50 == 0:
                             logger.info(f"  Resolved {resolved}/{len(snaps)}...")
+            self._save_probe_state(st)
             logger.info(f"  Resolved {resolved} short URLs "
                         f"({len(short) - resolved} unresolved — the previous JSON covers those)")
+        for i in full:
+            self._unresolved.pop(i, None)
         return list(full.values())
 
     def _resolve_short(self, disc_id: str, slug: str, ts: str, orig: str) -> str | None:
@@ -388,6 +417,139 @@ class ExamTopicsScraper:
                 pass
             time.sleep(5 * (attempt + 1))
         return None
+
+    # ═════════════════════════════════════════════
+    #  PHASE 2c: RESOLVE IDS BY PROBING (opt-in)
+    # ═════════════════════════════════════════════
+
+    def _probe_state_path(self) -> str | None:
+        if not self.state_dir:
+            return None
+        return f"{self.state_dir}/{self.provider}_{self.exam_code}_probe_state.json"
+
+    def _load_probe_state(self) -> dict:
+        path = self._probe_state_path()
+        if path:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    st = json.load(f)
+                st.setdefault("found", {})
+                st.setdefault("tried", {})
+                return st
+            except (OSError, json.JSONDecodeError):
+                pass
+        return {"found": {}, "tried": {}}
+
+    def _save_probe_state(self, st: dict):
+        path = self._probe_state_path()
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(st, f)
+
+    def _probe(self, session: requests.Session, url: str) -> bool:
+        """True if the URL exists (200), False on 404. Retries throttling/5xx."""
+        for attempt in range(6):
+            self._throttle()
+            try:
+                resp = session.get(url, timeout=30, allow_redirects=False)
+            except requests.RequestException:
+                time.sleep(5 * (attempt + 1))
+                continue
+            if resp.status_code == 200:
+                if self._is_challenge_page(resp.text):
+                    self._backoff(min(15 * 2 ** attempt, 300))
+                    continue
+                return True
+            if resp.status_code in (429, 500, 502, 503, 504):
+                retry_after = resp.headers.get("Retry-After", "")
+                self._backoff(int(retry_after) if retry_after.isdigit() else min(10 * 2 ** attempt, 300))
+                continue
+            return False
+        return False
+
+    def _resolve_by_probing(self, todo: dict[str, str], known_urls: list[str]) -> list[str]:
+        """
+        The live site only serves '<id>-exam-<slug>-topic-T-question-N-discussion/'.
+        For ids whose number is unknown, try candidate numbers in order of likelihood:
+        discussion ids roughly follow question order, so the numbers of the nearest
+        known ids (by id) bracket the answer. Each hit claims its number, narrowing
+        the search for the rest. Progress is saved so long runs can resume.
+        """
+        import bisect
+
+        anchors: list[tuple[int, int, int]] = []  # (id, topic, number), sorted by id
+        for u in known_urls:
+            m = self._FULL_URL.search(urlparse(u).path)
+            if m:
+                anchors.append((int(m.group(1)), int(m.group(3)), int(m.group(4))))
+        st = self._load_probe_state()  # includes the archive results saved above
+        found: dict[str, str] = {i: u for i, u in st["found"].items() if i in todo}
+        for u in found.values():
+            m = self._FULL_URL.search(urlparse(u).path)
+            if m:
+                anchors.append((int(m.group(1)), int(m.group(3)), int(m.group(4))))
+        anchors.sort()
+        if not anchors:
+            logger.warning("  No known question numbers to anchor on — cannot probe")
+            return []
+        claimed = {(t, q) for _, t, q in anchors}
+        topics = sorted({t for _, t, _ in anchors})
+        max_q = max(q for _, _, q in anchors) + 30
+
+        ids = sorted(int(i) for i in todo if i not in found)
+        if found:
+            logger.info(f"  Resuming: {len(found)} already resolved in a previous run")
+        logger.info(f"  {len(ids)} ids to resolve, up to {self.max_probes} guesses each "
+                    f"(~1 request/s — this can take hours; safe to stop and re-run)")
+
+        session = self._make_session()
+        requests_made = 0
+        for n, did in enumerate(ids, 1):
+            key = str(did)
+            tried = set(st["tried"].get(key, []))
+            pos = bisect.bisect_left(anchors, (did,))
+            lo = anchors[pos - 1] if pos > 0 else None
+            hi = anchors[pos] if pos < len(anchors) else None
+            near_topic = (lo or hi)[1]
+
+            def score(tq):
+                t, q = tq
+                if lo and hi:
+                    a, b = sorted((lo[2], hi[2]))
+                    dist = 0 if a <= q <= b else min(abs(q - a), abs(q - b))
+                    span = hi[0] - lo[0] or 1
+                    est = lo[2] + (hi[2] - lo[2]) * (did - lo[0]) / span
+                else:
+                    dist = abs(q - (lo or hi)[2])
+                    est = (lo or hi)[2]
+                return (t != near_topic, dist, abs(q - est))
+
+            cands = sorted(
+                ((t, q) for t in topics for q in range(1, max_q + 1)
+                 if (t, q) not in claimed and f"{t}-{q}" not in tried),
+                key=score,
+            )[: max(0, self.max_probes - len(tried))]
+
+            for t, q in cands:
+                url = (f"{BASE_URL}/discussions/{self.provider}/view/{did}-exam-{todo[key]}"
+                       f"-topic-{t}-question-{q}-discussion/")
+                requests_made += 1
+                hit = self._probe(session, url)
+                st["tried"].setdefault(key, []).append(f"{t}-{q}")
+                if hit:
+                    found[key] = url
+                    st["found"][key] = url
+                    st["tried"].pop(key, None)
+                    bisect.insort(anchors, (did, t, q))
+                    claimed.add((t, q))
+                    break
+                if requests_made % 25 == 0:
+                    self._save_probe_state(st)
+            self._save_probe_state(st)
+            if n % 10 == 0 or n == len(ids):
+                logger.info(f"  Probing: {n}/{len(ids)} ids tried, {len(found)} resolved, "
+                            f"{requests_made} requests this run")
+        return list(found.values())
 
     def _dedupe_by_id(self, urls: list[str]) -> list[str]:
         """One URL per discussion id, preferring the full (current) URL form."""

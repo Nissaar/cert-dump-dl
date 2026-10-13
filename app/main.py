@@ -215,14 +215,17 @@ def list_exams(provider: str):
 #  SCRAPING
 # ─────────────────────────────────────────────
 
-def run_scraper(provider: str, exam: str, include_comments: bool, crawl_index: bool = True) -> list[dict]:
+def run_scraper(provider: str, exam: str, include_comments: bool, crawl_index: bool = True,
+                resolve_ids: bool = False, max_probes: int = 120) -> list[dict]:
     """Scrape ExamTopics using plain HTTP (no JS = paywall bypass)."""
     console.print(f"\n[bold cyan]⏳ Scraping ExamTopics...[/]")
     console.print(f"   Provider: [yellow]{provider}[/]")
     console.print(f"   Exam:     [yellow]{exam}[/]")
     console.print(f"   Comments: [yellow]{'yes' if include_comments else 'no'}[/]\n")
 
-    scraper = ExamTopicsScraper(provider, exam, include_comments, crawl_index)
+    scraper = ExamTopicsScraper(provider, exam, include_comments, crawl_index,
+                                resolve_ids=resolve_ids, max_probes=max_probes,
+                                state_dir=str(OUTPUT_DIR))
     data = scraper.scrape_all()
 
     if data:
@@ -296,6 +299,11 @@ Exam codes must match the ExamTopics URL slug (lowercase).
                         help="Randomize question order")
     parser.add_argument("--skip-index", action="store_true",
                         help="Skip the slow live discussion-index crawl (archive discovery only)")
+    parser.add_argument("--resolve-ids", action="store_true",
+                        help="Find question numbers for archived discussion ids by trying candidate "
+                             "URLs (slow: hours per exam; resumable)")
+    parser.add_argument("--max-probes", type=int, default=120,
+                        help="Max guesses per discussion id with --resolve-ids (default: 120)")
     parser.add_argument("--list-exams", action="store_true",
                         help="List available exams for the provider and exit")
 
@@ -327,7 +335,8 @@ Exam codes must match the ExamTopics URL slug (lowercase).
     if args.json:
         questions = run_from_json(args.json)
     else:
-        questions = run_scraper(args.provider, args.exam, args.comments, not args.skip_index)
+        questions = run_scraper(args.provider, args.exam, args.comments, not args.skip_index,
+                                args.resolve_ids, args.max_probes)
         questions = merge_with_cache(questions, OUTPUT_DIR / f"{base_name}.json")
 
     if not questions:
