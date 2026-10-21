@@ -206,9 +206,9 @@ class ExamTopicsScraper:
         # ExamTopics lists exams as cards/links under /exams/{provider}/
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            # Match pattern: /exams/{provider}/{exam-code}/
+            # Match pattern: /exams/{provider}/{exam-code}/ (links may be absolute)
             m = re.match(
-                rf'/exams/{re.escape(provider.lower().strip())}/([a-z0-9\-]+)/',
+                rf'(?:https?://(?:www\.)?examtopics\.com)?/exams/{re.escape(provider.lower().strip())}/([a-z0-9\-]+)/',
                 href.lower(),
             )
             if not m:
