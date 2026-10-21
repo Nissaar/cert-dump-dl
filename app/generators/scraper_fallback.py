@@ -57,7 +57,7 @@ HEADERS = {
 BASE_URL = "https://www.examtopics.com"
 ARCHIVE_CDX = "https://web.archive.org/cdx/search/cdx"
 ARCHIVE_WEB = "https://web.archive.org/web"
-ARCHIVE_INTERVAL = 1.0  # seconds between archive.org snapshot fetches
+ARCHIVE_INTERVAL = float(os.environ.get("ARCHIVE_INTERVAL_SECONDS", "5"))  # between archive.org snapshot fetches (it blocks fast readers)
 
 # All threads AND all exams of one process share one pacer: at most one request
 # every BASE_INTERVAL seconds, stretched (up to MAX_INTERVAL) whenever ExamTopics
@@ -495,7 +495,7 @@ class ExamTopicsScraper:
                     snaps[m.group(1)] = (ts, orig)
             logger.info(f"  {len(snaps)} short URLs have an archived copy — reading question numbers...")
             resolved = done = 0
-            with _pool(2) as ex:
+            with _pool(1) as ex:
                 futures = {ex.submit(self._resolve_short, i, short[i], *snaps[i]): i for i in snaps}
                 for f in as_completed(futures):
                     url = f.result()
