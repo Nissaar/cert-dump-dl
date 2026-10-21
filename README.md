@@ -51,6 +51,10 @@ docker run --rm -v $(pwd)/output:/app/output exam-studio \
   --json /app/output/microsoft_az-400.json -f html --theme light --shuffle
 ```
 
+## Rate limiting (HTTP 429)
+
+All requests share one pace (one every 2.5 s, doubled after each 429 up to 60 s) and honour `Retry-After`. The provider's discussion index is cached for a day in `output/index_<provider>.json`, so scraping several exams of one provider reads it once. If ExamTopics keeps refusing, the scraper stops (exit code 3) and refuses to start again for 6 hours (`output/ratelimit.json`; delete it to retry sooner). Tune with `-e EXAMTOPICS_PACE_SECONDS=…`, `EXAMTOPICS_MAX_PACE_SECONDS`, `EXAMTOPICS_COOLDOWN_SECONDS`, `EXAMTOPICS_INDEX_MAX_AGE_SECONDS`.
+
 ## The HTML study app
 
 The generated `.html` is a single self-contained file (no internet needed):

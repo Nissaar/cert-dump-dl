@@ -27,6 +27,7 @@ import base64
 import html
 import json
 import logging
+import os
 import re
 import time
 import threading
@@ -57,15 +58,65 @@ ARCHIVE_CDX = "https://web.archive.org/cdx/search/cdx"
 ARCHIVE_WEB = "https://web.archive.org/web"
 ARCHIVE_INTERVAL = 1.0  # seconds between archive.org snapshot fetches
 
-# All threads share one pacer: at most one request every BASE_INTERVAL seconds,
-# stretched (up to MAX_INTERVAL) whenever ExamTopics answers 429 / a challenge.
-BASE_INTERVAL = 1.0
-MAX_INTERVAL = 6.0
-INDEX_WORKERS = 3
-DISC_WORKERS = 4
+# All threads AND all exams of one process share one pacer: at most one request
+# every BASE_INTERVAL seconds, stretched (up to MAX_INTERVAL) whenever ExamTopics
+# answers 429 / a challenge, and only slowly sped up again.
+BASE_INTERVAL = float(os.environ.get("EXAMTOPICS_PACE_SECONDS", "2.5"))
+MAX_INTERVAL = float(os.environ.get("EXAMTOPICS_MAX_PACE_SECONDS", "60"))
+INDEX_WORKERS = 2
+DISC_WORKERS = 2
+# A request still refused after all its retries means we are blocked: stop the
+# whole run and stay away this long (remembered in state_dir across runs).
+COOLDOWN_SECONDS = int(os.environ.get("EXAMTOPICS_COOLDOWN_SECONDS", "21600"))
+# The provider's discussion index is shared by all its exams: crawl it once and
+# reuse it for this long (in memory, and in state_dir across runs).
+INDEX_MAX_AGE = int(os.environ.get("EXAMTOPICS_INDEX_MAX_AGE_SECONDS", "86400"))
+
+
+class RateLimitedError(RuntimeError):
+    """ExamTopics keeps answering 429 / challenges: stop instead of hammering."""
+
+
+class _Pacer:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.interval = BASE_INTERVAL
+        self.next_slot = 0.0
+        self.blocked = False
+
+
+_PACER = _Pacer()
+_INDEX_CACHE: dict[str, tuple[float, list[str]]] = {}  # provider -> (time, all discussion URLs)
+
+
+def _cooldown_path(state_dir):
+    return os.path.join(state_dir, "ratelimit.json") if state_dir else None
+
+
+def cooldown_remaining(state_dir) -> int:
+    """Seconds left of a cool-down saved by an earlier blocked run (0 = none)."""
+    path = _cooldown_path(state_dir)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return max(0, int(json.load(f).get("until", 0) - time.time()))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
+
+
+def _save_cooldown(state_dir):
+    path = _cooldown_path(state_dir)
+    if not path:
+        return
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"until": time.time() + COOLDOWN_SECONDS}, f)
+    except OSError:
+        pass
 
 
 class ExamTopicsScraper:
+    RateLimited = RateLimitedError
     def __init__(self, provider: str, exam_code: str, include_comments: bool = True,
                  crawl_index: bool = True, resolve_ids: bool = False,
                  max_probes: int = 120, state_dir: str | None = None):
@@ -75,9 +126,6 @@ class ExamTopicsScraper:
         self._image_cache: dict[str, str] = {}
         self._image_lock = threading.Lock()
         self._progress_lock = threading.Lock()
-        self._rate_lock = threading.Lock()
-        self._interval = BASE_INTERVAL
-        self._next_slot = 0.0
         self._failed_pages: list[int] = []
         self.crawl_index = crawl_index
         self.resolve_ids = resolve_ids
@@ -88,6 +136,8 @@ class ExamTopicsScraper:
         self._archive_next = 0.0
         self._urls_found = 0
         self._questions_scraped = 0
+        # questions saved by an earlier run (set by the caller): their pages are not fetched again
+        self.previous: list[dict] = []
 
     def _make_session(self) -> requests.Session:
         s = requests.Session()
@@ -107,9 +157,15 @@ class ExamTopicsScraper:
         Merge uses URL as unique key (not topic/question number).
         """
 
+        left = cooldown_remaining(self.state_dir)
+        if left:
+            raise RateLimitedError(f"ExamTopics blocked an earlier run: cooling down {left // 60} more minutes")
+        _PACER.blocked = False
+
         # ── Phase 1 ──
         logger.info("Phase 1: Fetching exam overview...")
         first_10, total_expected = self._scrape_exam_view_page1()
+        self._raise_if_blocked()
         logger.info(f"  Got {len(first_10)} preview questions, {total_expected} total expected\n")
 
         # ── Phase 2 ──
@@ -133,6 +189,7 @@ class ExamTopicsScraper:
                 disc_urls = self._dedupe_by_id(disc_urls + self._resolve_by_probing(todo, disc_urls))
         logger.info(f"\n  Found {len(disc_urls)} discussion URLs total\n")
 
+        self._raise_if_blocked()
         if not disc_urls and not first_10:
             return []
 
@@ -140,18 +197,24 @@ class ExamTopicsScraper:
             logger.warning("  No discussion URLs found — returning exam page preview only")
             return first_10
 
-        # ── Phase 3 ──
-        logger.info(f"Phase 3: Scraping {len(disc_urls)} discussion pages...")
-        disc_questions = self._scrape_all_discussions(disc_urls)
+        # ── Phase 3 ── (pages already saved by an earlier run are not fetched again)
+        known = {self._make_merge_key(q) for q in self.previous if q.get("question_link")}
+        todo = [u for u in disc_urls if u.lower().rstrip("/") not in known]
+        logger.info(f"Phase 3: Scraping {len(todo)} discussion pages "
+                    f"({len(disc_urls) - len(todo)} already saved)...")
+        disc_questions = self._scrape_all_discussions(todo)
         logger.info(f"  Scraped {len(disc_questions)} questions from discussions\n")
+        self._raise_if_blocked()
 
         # ── Merge using URL as primary key ──
         merged: dict[str, dict] = {}
+        for q in self.previous:
+            merged[self._make_merge_key(q)] = q
 
-        # Add Phase 1 questions (keyed by constructed discussion URL)
+        # Add Phase 1 questions (keyed by constructed discussion URL); never over a saved full one
         for q in first_10:
             key = self._make_merge_key(q)
-            merged[key] = q
+            merged.setdefault(key, q)
 
         # Override with discussion versions (they include comments)
         for q in disc_questions:
@@ -186,18 +249,12 @@ class ExamTopicsScraper:
         List all available exams for a provider.
         Scrapes https://www.examtopics.com/exams/{provider}/
         """
-        session = requests.Session()
-        session.headers.update(HEADERS)
-
+        helper = ExamTopicsScraper(provider, "-")
         url = f"{BASE_URL}/exams/{provider.lower().strip()}/"
-        try:
-            resp = session.get(url, timeout=30)
-        except requests.RequestException as e:
-            logger.error(f"  Cannot reach {url}: {e}")
-            return []
-
-        if resp.status_code != 200:
-            logger.error(f"  HTTP {resp.status_code} from {url}")
+        resp = helper._fetch_with_session(helper._make_session(), url)
+        helper._raise_if_blocked()
+        if not resp:
+            logger.error(f"  Cannot read {url}")
             return []
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -449,6 +506,8 @@ class ExamTopicsScraper:
     def _probe(self, session: requests.Session, url: str) -> bool:
         """True if the URL exists (200), False on 404. Retries throttling/5xx."""
         for attempt in range(6):
+            if _PACER.blocked:
+                return False
             self._throttle()
             try:
                 resp = session.get(url, timeout=30, allow_redirects=False)
@@ -561,7 +620,38 @@ class ExamTopicsScraper:
                 best[key] = u
         return sorted(best.values())
 
+    def _index_cache_path(self):
+        return os.path.join(self.state_dir, f"index_{self.provider}.json") if self.state_dir else None
+
     def _crawl_full_discussion_index(self) -> list[str]:
+        """This exam's URLs from the provider's index, crawled once and shared by all its exams."""
+        cached = _INDEX_CACHE.get(self.provider)
+        path = self._index_cache_path()
+        if not cached and path:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    d = json.load(f)
+                cached = (float(d["time"]), list(d["urls"]))
+            except (OSError, ValueError, KeyError, TypeError):
+                cached = None
+        if cached and time.time() - cached[0] < INDEX_MAX_AGE:
+            logger.info(f"  Reusing the {self.provider} discussion index from "
+                        f"{int((time.time() - cached[0]) // 60)} min ago ({len(cached[1])} URLs)")
+            all_urls = cached[1]
+        else:
+            all_urls = self._crawl_provider_index()
+            if all_urls and not self._failed_pages and not _PACER.blocked:
+                _INDEX_CACHE[self.provider] = (time.time(), all_urls)
+                if path:
+                    try:
+                        os.makedirs(self.state_dir, exist_ok=True)
+                        with open(path, "w", encoding="utf-8") as f:
+                            json.dump({"time": time.time(), "urls": all_urls}, f)
+                    except OSError:
+                        pass
+        return sorted(u for u in all_urls if self.exam_code in u.lower())
+
+    def _crawl_provider_index(self) -> list[str]:
         session = self._make_session()
         first_url = f"{BASE_URL}/discussions/{self.provider}/"
         resp = self._fetch_with_session(session, first_url)
@@ -578,7 +668,7 @@ class ExamTopicsScraper:
         logger.info(f"  Discussion index has {max_pages} pages to scan")
 
         all_urls: set[str] = set()
-        page1_links = self._extract_exam_links(soup)
+        page1_links = self._extract_exam_links(soup, any_exam=True)
         all_urls.update(page1_links)
         if page1_links:
             logger.info(f"  Page 1: +{len(page1_links)} URLs")
@@ -618,6 +708,8 @@ class ExamTopicsScraper:
         results: set[str] = set()
 
         for page_num in pages:
+            if _PACER.blocked:
+                break
             url = f"{BASE_URL}/discussions/{self.provider}/{page_num}"
             resp = self._fetch_with_session(session, url)
 
@@ -626,7 +718,7 @@ class ExamTopicsScraper:
                     self._failed_pages.append(page_num)
             if resp:
                 soup = BeautifulSoup(resp.text, "html.parser")
-                found = self._extract_exam_links(soup)
+                found = self._extract_exam_links(soup, any_exam=True)
                 results.update(found)
                 if found:
                     with self._progress_lock:
@@ -642,7 +734,7 @@ class ExamTopicsScraper:
 
         return results
 
-    def _extract_exam_links(self, soup: BeautifulSoup) -> set[str]:
+    def _extract_exam_links(self, soup: BeautifulSoup, any_exam: bool = False) -> set[str]:
         """
         Find all discussion links matching this exam code.
         Handles both URL patterns:
@@ -650,7 +742,7 @@ class ExamTopicsScraper:
           - /view/{id}-exam-aws-certified-solutions-architect-associate-saa-c03-topic-...
         """
         links: set[str] = set()
-        exam_lower = self.exam_code
+        exam_lower = "" if any_exam else self.exam_code
 
         for a in soup.find_all("a", href=True):
             href = a["href"].lower()
@@ -1299,8 +1391,14 @@ class ExamTopicsScraper:
                 return self._image_cache[src]
         full_url = urljoin(BASE_URL, src)
         try:
+            if _PACER.blocked:
+                return None
+            self._throttle()
             session = self._make_session()
             resp = session.get(full_url, timeout=15)
+            if resp.status_code == 429:
+                self._backoff(60)
+                return None
             if resp.status_code != 200 or len(resp.content) < 100:
                 return None
             ct = resp.headers.get("Content-Type", "image/png").split(";")[0].strip()
@@ -1327,42 +1425,63 @@ class ExamTopicsScraper:
         )
 
     def _throttle(self):
-        """Shared pacing across all worker threads (ExamTopics rate-limits per IP)."""
-        with self._rate_lock:
+        """Shared pacing across all threads and exams (ExamTopics rate-limits per IP)."""
+        with _PACER.lock:
             now = time.monotonic()
-            slot = max(now, self._next_slot)
-            self._next_slot = slot + self._interval
+            slot = max(now, _PACER.next_slot)
+            _PACER.next_slot = slot + _PACER.interval
         if slot > now:
             time.sleep(slot - now)
 
     def _backoff(self, seconds: float):
         """Slow everyone down after a 429/challenge, then pause this thread."""
-        with self._rate_lock:
-            self._interval = min(self._interval * 1.5, MAX_INTERVAL)
-            self._next_slot = max(self._next_slot, time.monotonic() + seconds)
+        with _PACER.lock:
+            _PACER.interval = min(_PACER.interval * 2, MAX_INTERVAL)
+            _PACER.next_slot = max(_PACER.next_slot, time.monotonic() + seconds)
         time.sleep(seconds)
+
+    def _blocked(self):
+        """Retries exhausted on 429/challenge: stop every thread and remember a cool-down."""
+        with _PACER.lock:
+            first = not _PACER.blocked
+            _PACER.blocked = True
+        if first:
+            logger.error(f"  ExamTopics keeps refusing (429): stopping, "
+                         f"no more requests for {COOLDOWN_SECONDS // 60} min")
+            _save_cooldown(self.state_dir)
+
+    def _raise_if_blocked(self):
+        if _PACER.blocked:
+            raise RateLimitedError("ExamTopics rate limit (429): run stopped, try again after the cool-down")
 
     def _fetch_with_session(
         self, session: requests.Session, url: str, retries: int = 6,
     ) -> requests.Response | None:
+        refused = False
         for attempt in range(retries):
+            if _PACER.blocked:
+                return None
             self._throttle()
             try:
                 resp = session.get(url, timeout=30)
+                refused = False
                 if resp.status_code == 200 and self._is_challenge_page(resp.text):
-                    wait = min(15 * 2 ** attempt, 300)
+                    refused = True
+                    wait = min(30 * 2 ** attempt, 900)
                     logger.warning(f"  Cloudflare challenge → pausing {wait}s...")
                     self._backoff(wait)
                     continue
                 if resp.status_code == 200:
-                    with self._rate_lock:  # recover speed slowly after throttling
-                        self._interval = max(BASE_INTERVAL, self._interval * 0.97)
+                    with _PACER.lock:  # recover speed slowly after throttling
+                        _PACER.interval = max(BASE_INTERVAL, _PACER.interval * 0.99)
                     return resp
                 if resp.status_code in (429, 500, 502, 503, 504):
+                    refused = resp.status_code == 429
                     retry_after = resp.headers.get("Retry-After", "")
-                    wait = int(retry_after) if retry_after.isdigit() else min(10 * 2 ** attempt, 300)
+                    wait = int(retry_after) if retry_after.isdigit() else (
+                        min(60 * 2 ** attempt, 900) if refused else min(10 * 2 ** attempt, 300))
                     logger.warning(f"  HTTP {resp.status_code} → pausing {wait}s "
-                                   f"(pace now {self._interval:.1f}s/request)...")
+                                   f"(pace now {_PACER.interval:.1f}s/request)...")
                     self._backoff(wait)
                     continue
                 if resp.status_code == 404:
@@ -1373,4 +1492,6 @@ class ExamTopicsScraper:
                 wait = 2 ** (attempt + 1)
                 logger.error(f"  Request error ({url}): {e}")
                 time.sleep(wait)
+        if refused:
+            self._blocked()
         return None

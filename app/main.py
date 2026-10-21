@@ -226,7 +226,13 @@ def run_scraper(provider: str, exam: str, include_comments: bool, crawl_index: b
     scraper = ExamTopicsScraper(provider, exam, include_comments, crawl_index,
                                 resolve_ids=resolve_ids, max_probes=max_probes,
                                 state_dir=str(OUTPUT_DIR))
-    data = scraper.scrape_all()
+    try:
+        data = scraper.scrape_all()
+    except ExamTopicsScraper.RateLimited as exc:
+        console.print(f"\n[bold red]⛔ {exc}[/]")
+        console.print("[yellow]ExamTopics is rate limiting this IP (429). Try again later; "
+                      "set EXAMTOPICS_COOLDOWN_SECONDS=0 to skip the wait.[/]")
+        sys.exit(3)
 
     if data:
         console.print(f"\n[bold green]✅ Scraped {len(data)} questions[/]\n")
