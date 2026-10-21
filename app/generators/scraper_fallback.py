@@ -457,7 +457,7 @@ class ExamTopicsScraper:
                 if m and m.group(1) in short and m.group(1) not in skip:
                     snaps[m.group(1)] = (ts, orig)
             logger.info(f"  {len(snaps)} short URLs have an archived copy — reading question numbers...")
-            resolved = 0
+            resolved = done = 0
             with _pool(2) as ex:
                 futures = {ex.submit(self._resolve_short, i, short[i], *snaps[i]): i for i in snaps}
                 for f in as_completed(futures):
@@ -468,10 +468,11 @@ class ExamTopicsScraper:
                         resolved += 1
                     else:
                         st.setdefault("archive_failed", []).append(futures[f])
-                    if (resolved + len(st.get("archive_failed", []))) % 20 == 0:
+                    done += 1
+                    if done % 20 == 0:
                         self._save_probe_state(st)
-                        if resolved % 50 == 0:
-                            logger.info(f"  Resolved {resolved}/{len(snaps)}...")
+                        logger.info(f"  Archive copies read: {done}/{len(snaps)} "
+                                    f"({resolved} question numbers found)...")
             self._save_probe_state(st)
             logger.info(f"  Resolved {resolved} short URLs "
                         f"({len(short) - resolved} unresolved — the previous JSON covers those)")
@@ -505,6 +506,14 @@ class ExamTopicsScraper:
                             f"-topic-{topic}-question-{qnum}-discussion/")
                 if resp.status_code in (404, 403):
                     return None
+                if resp.status_code == 429:  # archive.org rate limit: slow every thread down
+                    retry_after = resp.headers.get("Retry-After", "")
+                    wait = int(retry_after) if retry_after.isdigit() else 60 * (attempt + 1)
+                    logger.warning(f"  Archive HTTP 429 → pausing {wait}s...")
+                    with self._archive_lock:
+                        self._archive_next = max(self._archive_next, time.monotonic() + wait)
+                    _sleep(wait)
+                    continue
             except requests.RequestException:
                 pass
             _sleep(5 * (attempt + 1))
