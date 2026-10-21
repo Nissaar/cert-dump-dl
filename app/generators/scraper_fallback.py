@@ -104,10 +104,10 @@ def _pool(workers: int):
     try:
         yield ex
     except BaseException:
-        _STOP.set()
+        _STOP.set()  # workers stop at their next check; one in a request may need up to its timeout,
+        ex.shutdown(wait=False, cancel_futures=True)  # so do not wait for it (the caller exits)
         raise
-    finally:
-        ex.shutdown(wait=True, cancel_futures=True)
+    ex.shutdown(wait=True)
 
 
 # archive.org kept refusing (429 / connection refused = IP blocked): leave it alone for a while, since
