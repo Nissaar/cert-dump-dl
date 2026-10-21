@@ -109,8 +109,10 @@ def _pool(workers: int):
         ex.shutdown(wait=True, cancel_futures=True)
 
 
-_ARCHIVE = {"down_until": 0.0}  # archive.org kept refusing: leave it alone for a while (its block grows while we retry)
-ARCHIVE_PAUSE = 3 * 3600
+# archive.org kept refusing (429 / connection refused = IP blocked): leave it alone for a while, since
+# its block grows while we retry. Saved in state_dir so the next exam's process respects it too.
+_ARCHIVE = {"down_until": 0.0, "told": False}
+ARCHIVE_PAUSE = int(os.environ.get("ARCHIVE_PAUSE_SECONDS", str(3 * 3600)))
 _INDEX_CACHE: dict[str, tuple[float, list[str]]] = {}  # provider -> (time, all discussion URLs)
 
 
@@ -393,7 +395,7 @@ class ExamTopicsScraper:
         url = (f"{ARCHIVE_CDX}?url=examtopics.com/discussions/{self.provider}/view/"
                f"&matchType=prefix&filter=original:.*{re.escape(self.exam_code)}.*"
                f"&collapse=urlkey&output=json&limit=200000{extra}")
-        if time.time() < _ARCHIVE["down_until"]:
+        if self._archive_down():
             return []
         session = self._make_session()
         for attempt in range(5):
@@ -407,13 +409,46 @@ class ExamTopicsScraper:
                 if retry_after.isdigit():
                     wait = min(int(retry_after), 1800)
                 logger.warning(f"  Archive CDX HTTP {resp.status_code} → pausing {wait}s...")
+            except requests.ConnectionError:
+                self._archive_give_up("archive.org refuses connections (IP blocked)")
+                return []
             except (requests.RequestException, ValueError) as e:
                 logger.warning(f"  Archive CDX error: {e} → pausing {wait}s...")
             _sleep(wait)
-        logger.warning(f"  Archive CDX unavailable: not asking it again for {ARCHIVE_PAUSE // 3600} h, "
-                       f"using the live index only")
-        _ARCHIVE["down_until"] = time.time() + ARCHIVE_PAUSE
+        self._archive_give_up("archive.org keeps refusing")
         return []
+
+    def _archive_pause_path(self):
+        return os.path.join(self.state_dir, "archive_pause.json") if self.state_dir else None
+
+    def _archive_down(self) -> bool:
+        if time.time() >= _ARCHIVE["down_until"] and self._archive_pause_path():
+            try:
+                with open(self._archive_pause_path(), encoding="utf-8") as f:
+                    _ARCHIVE["down_until"] = float(json.load(f).get("until", 0))
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+        left = _ARCHIVE["down_until"] - time.time()
+        if left > 0 and not _ARCHIVE["told"]:
+            _ARCHIVE["told"] = True
+            logger.warning(f"  Archive paused for {int(left // 60)} more min (archive.org refused earlier): "
+                           f"using the live index only")
+        return left > 0
+
+    def _archive_give_up(self, why: str):
+        with self._archive_lock:
+            if time.time() < _ARCHIVE["down_until"]:
+                return
+            _ARCHIVE["down_until"], _ARCHIVE["told"] = time.time() + ARCHIVE_PAUSE, True
+        logger.warning(f"  {why}: not asking it again for {ARCHIVE_PAUSE // 60} min, using the live index only")
+        path = self._archive_pause_path()
+        if path:
+            try:
+                os.makedirs(self.state_dir, exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump({"until": _ARCHIVE["down_until"]}, f)
+            except OSError:
+                pass
 
     def _discover_from_archive(self) -> list[str]:
         """
@@ -466,7 +501,7 @@ class ExamTopicsScraper:
                         full[futures[f]] = url
                         st.setdefault("archive", {})[futures[f]] = url
                         resolved += 1
-                    else:
+                    elif not self._archive_down():  # a page we could not read while blocked is retried next time
                         st.setdefault("archive_failed", []).append(futures[f])
                     done += 1
                     if done % 20 == 0:
@@ -481,6 +516,8 @@ class ExamTopicsScraper:
         return list(full.values())
 
     def _resolve_short(self, disc_id: str, slug: str, ts: str, orig: str) -> str | None:
+        if self._archive_down():
+            return None
         with self._archive_lock:
             wait = self._archive_next - time.monotonic()
             self._archive_next = max(time.monotonic(), self._archive_next) + ARCHIVE_INTERVAL
@@ -514,6 +551,9 @@ class ExamTopicsScraper:
                         self._archive_next = max(self._archive_next, time.monotonic() + wait)
                     _sleep(wait)
                     continue
+            except requests.ConnectionError:
+                self._archive_give_up("archive.org refuses connections (IP blocked)")
+                return None
             except requests.RequestException:
                 pass
             _sleep(5 * (attempt + 1))
