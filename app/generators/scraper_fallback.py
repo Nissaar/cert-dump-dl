@@ -86,6 +86,8 @@ class _Pacer:
 
 
 _PACER = _Pacer()
+_ARCHIVE = {"down_until": 0.0}  # archive.org kept refusing: leave it alone for a while (its block grows while we retry)
+ARCHIVE_PAUSE = 3 * 3600
 _INDEX_CACHE: dict[str, tuple[float, list[str]]] = {}  # provider -> (time, all discussion URLs)
 
 
@@ -367,6 +369,8 @@ class ExamTopicsScraper:
         url = (f"{ARCHIVE_CDX}?url=examtopics.com/discussions/{self.provider}/view/"
                f"&matchType=prefix&filter=original:.*{re.escape(self.exam_code)}.*"
                f"&collapse=urlkey&output=json&limit=200000{extra}")
+        if time.time() < _ARCHIVE["down_until"]:
+            return []
         session = self._make_session()
         for attempt in range(5):
             wait = min(30 * 2 ** attempt, 600)  # archive.org rate-limits too: 30 s … 10 min
@@ -382,7 +386,9 @@ class ExamTopicsScraper:
             except (requests.RequestException, ValueError) as e:
                 logger.warning(f"  Archive CDX error: {e} → pausing {wait}s...")
             time.sleep(wait)
-        logger.warning("  Archive CDX unavailable: continuing with the live index only")
+        logger.warning(f"  Archive CDX unavailable: not asking it again for {ARCHIVE_PAUSE // 3600} h, "
+                       f"using the live index only")
+        _ARCHIVE["down_until"] = time.time() + ARCHIVE_PAUSE
         return []
 
     def _discover_from_archive(self) -> list[str]:
