@@ -24,6 +24,7 @@ URL patterns:
 """
 
 import base64
+import contextlib
 import html
 import json
 import logging
@@ -86,6 +87,28 @@ class _Pacer:
 
 
 _PACER = _Pacer()
+_STOP = threading.Event()  # Ctrl-C: every worker stops waiting and returns at once
+
+
+def _sleep(seconds: float):
+    """time.sleep that Ctrl-C (via _STOP) cuts short in every thread."""
+    if seconds > 0:
+        _STOP.wait(seconds)
+
+
+@contextlib.contextmanager
+def _pool(workers: int):
+    """ThreadPoolExecutor whose threads stop at once when the main thread is interrupted."""
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
+        yield ex
+    except BaseException:
+        _STOP.set()
+        raise
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+
+
 _ARCHIVE = {"down_until": 0.0}  # archive.org kept refusing: leave it alone for a while (its block grows while we retry)
 ARCHIVE_PAUSE = 3 * 3600
 _INDEX_CACHE: dict[str, tuple[float, list[str]]] = {}  # provider -> (time, all discussion URLs)
@@ -163,6 +186,7 @@ class ExamTopicsScraper:
         if left:
             raise RateLimitedError(f"ExamTopics blocked an earlier run: cooling down {left // 60} more minutes")
         _PACER.blocked = False
+        _STOP.clear()
 
         # ── Phase 1 ──
         logger.info("Phase 1: Fetching exam overview...")
@@ -385,7 +409,7 @@ class ExamTopicsScraper:
                 logger.warning(f"  Archive CDX HTTP {resp.status_code} → pausing {wait}s...")
             except (requests.RequestException, ValueError) as e:
                 logger.warning(f"  Archive CDX error: {e} → pausing {wait}s...")
-            time.sleep(wait)
+            _sleep(wait)
         logger.warning(f"  Archive CDX unavailable: not asking it again for {ARCHIVE_PAUSE // 3600} h, "
                        f"using the live index only")
         _ARCHIVE["down_until"] = time.time() + ARCHIVE_PAUSE
@@ -434,7 +458,7 @@ class ExamTopicsScraper:
                     snaps[m.group(1)] = (ts, orig)
             logger.info(f"  {len(snaps)} short URLs have an archived copy — reading question numbers...")
             resolved = 0
-            with ThreadPoolExecutor(max_workers=2) as ex:
+            with _pool(2) as ex:
                 futures = {ex.submit(self._resolve_short, i, short[i], *snaps[i]): i for i in snaps}
                 for f in as_completed(futures):
                     url = f.result()
@@ -460,7 +484,7 @@ class ExamTopicsScraper:
             wait = self._archive_next - time.monotonic()
             self._archive_next = max(time.monotonic(), self._archive_next) + ARCHIVE_INTERVAL
         if wait > 0:
-            time.sleep(wait)
+            _sleep(wait)
         session = self._make_session()
         for attempt in range(3):
             try:
@@ -483,7 +507,7 @@ class ExamTopicsScraper:
                     return None
             except requests.RequestException:
                 pass
-            time.sleep(5 * (attempt + 1))
+            _sleep(5 * (attempt + 1))
         return None
 
     # ═════════════════════════════════════════════
@@ -517,13 +541,13 @@ class ExamTopicsScraper:
     def _probe(self, session: requests.Session, url: str) -> bool:
         """True if the URL exists (200), False on 404. Retries throttling/5xx."""
         for attempt in range(6):
-            if _PACER.blocked:
+            if _PACER.blocked or _STOP.is_set():
                 return False
             self._throttle()
             try:
                 resp = session.get(url, timeout=30, allow_redirects=False)
             except requests.RequestException:
-                time.sleep(5 * (attempt + 1))
+                _sleep(5 * (attempt + 1))
                 continue
             if resp.status_code == 200:
                 if self._is_challenge_page(resp.text):
@@ -635,91 +659,114 @@ class ExamTopicsScraper:
         return os.path.join(self.state_dir, f"index_{self.provider}.json") if self.state_dir else None
 
     def _crawl_full_discussion_index(self) -> list[str]:
-        """This exam's URLs from the provider's index, crawled once and shared by all its exams."""
+        """This exam's URLs from the provider's index, crawled once and shared by all its exams.
+        Progress is saved as it goes, so an interrupted crawl resumes where it stopped."""
         cached = _INDEX_CACHE.get(self.provider)
         path = self._index_cache_path()
+        saved = None
         if not cached and path:
             try:
                 with open(path, encoding="utf-8") as f:
                     d = json.load(f)
-                cached = (float(d["time"]), list(d["urls"]))
-            except (OSError, ValueError, KeyError, TypeError):
-                cached = None
+                if d.get("complete", True):
+                    cached = (float(d["time"]), list(d["urls"]))
+                else:
+                    saved = d
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                pass
         if cached and time.time() - cached[0] < INDEX_MAX_AGE:
             logger.info(f"  Reusing the {self.provider} discussion index from "
                         f"{int((time.time() - cached[0]) // 60)} min ago ({len(cached[1])} URLs)")
             all_urls = cached[1]
         else:
-            all_urls = self._crawl_provider_index()
-            if all_urls and not self._failed_pages and not _PACER.blocked:
+            fresh = saved if saved and time.time() - float(saved.get("time", 0)) < INDEX_MAX_AGE else None
+            all_urls, complete = self._crawl_provider_index(fresh)
+            if complete:
                 _INDEX_CACHE[self.provider] = (time.time(), all_urls)
-                if path:
-                    try:
-                        os.makedirs(self.state_dir, exist_ok=True)
-                        with open(path, "w", encoding="utf-8") as f:
-                            json.dump({"time": time.time(), "urls": all_urls}, f)
-                    except OSError:
-                        pass
         return sorted(u for u in all_urls if self.exam_code in u.lower())
 
-    def _crawl_provider_index(self) -> list[str]:
+    def _save_index(self, complete: bool):
+        path = self._index_cache_path()
+        if not path:
+            return
+        st = self._index_state
+        with self._progress_lock:
+            data = {"time": time.time() if complete else st["time"], "complete": complete,
+                    "max_pages": st["max"], "pages_done": sorted(st["done"]), "urls": sorted(st["urls"])}
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _crawl_provider_index(self, resume: dict | None = None) -> tuple[list[str], bool]:
         session = self._make_session()
         first_url = f"{BASE_URL}/discussions/{self.provider}/"
         resp = self._fetch_with_session(session, first_url)
         if not resp:
             logger.error("  Cannot reach discussion index")
-            return []
+            return [], False
 
         soup = BeautifulSoup(resp.text, "html.parser")
         if self._is_challenge_page(resp.text):
             logger.error("  Cloudflare challenge on discussion index")
-            return []
+            return [], False
 
         max_pages = self._get_max_discussion_pages(soup)
         logger.info(f"  Discussion index has {max_pages} pages to scan")
 
-        all_urls: set[str] = set()
         page1_links = self._extract_exam_links(soup, any_exam=True)
-        all_urls.update(page1_links)
+        self._index_state = {"time": time.time(), "max": max_pages, "done": {1}, "urls": set(page1_links)}
+        if resume:
+            self._index_state["time"] = float(resume.get("time", time.time()))
+            self._index_state["done"].update(int(n) for n in resume.get("pages_done", []))
+            self._index_state["urls"].update(resume.get("urls", []))
+            logger.info(f"  Resuming an interrupted crawl: {len(self._index_state['done'])} pages "
+                        f"already read, {len(self._index_state['urls'])} URLs")
         if page1_links:
             logger.info(f"  Page 1: +{len(page1_links)} URLs")
 
-        self._urls_found = len(all_urls)
+        self._urls_found = len(self._index_state["urls"])
 
-        remaining = list(range(2, max_pages + 1))
-        if not remaining:
-            return sorted(all_urls)
+        remaining = [n for n in range(2, max_pages + 1) if n not in self._index_state["done"]]
+        if remaining:
+            batch_size = max(1, len(remaining) // INDEX_WORKERS + 1)
+            batches = [remaining[i:i + batch_size]
+                       for i in range(0, len(remaining), batch_size)]
 
-        batch_size = max(1, len(remaining) // INDEX_WORKERS + 1)
-        batches = [remaining[i:i + batch_size]
-                    for i in range(0, len(remaining), batch_size)]
+            logger.info(f"  Launching {len(batches)} workers across {len(remaining)} pages...\n")
 
-        logger.info(f"  Launching {len(batches)} workers across {len(remaining)} pages...\n")
-
-        with ThreadPoolExecutor(max_workers=INDEX_WORKERS) as executor:
-            futures = {
-                executor.submit(self._crawl_index_batch, batch, max_pages): i
-                for i, batch in enumerate(batches)
-            }
-            for future in as_completed(futures):
-                try:
-                    batch_urls = future.result()
-                    all_urls.update(batch_urls)
-                except Exception as e:
-                    logger.error(f"  Index batch error: {e}")
+            try:
+                with _pool(INDEX_WORKERS) as executor:
+                    futures = {
+                        executor.submit(self._crawl_index_batch, batch, max_pages): i
+                        for i, batch in enumerate(batches)
+                    }
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logger.error(f"  Index batch error: {e}")
+            finally:
+                complete = not self._failed_pages and not _PACER.blocked and not _STOP.is_set()
+                self._save_index(complete)
+        else:
+            complete = True
+            self._save_index(True)
 
         if self._failed_pages:
             logger.warning(f"  ⚠ {len(self._failed_pages)} index pages could not be fetched "
-                           f"(rate limited) — some questions may be missing; "
-                           f"the previous JSON fills the gaps")
-        return sorted(all_urls)
+                           f"(rate limited) — the next run retries just those")
+        return sorted(self._index_state["urls"]), complete
 
-    def _crawl_index_batch(self, pages: list[int], max_pages: int) -> set[str]:
+    def _crawl_index_batch(self, pages: list[int], max_pages: int) -> None:
         session = self._make_session()
-        results: set[str] = set()
 
         for page_num in pages:
-            if _PACER.blocked:
+            if _PACER.blocked or _STOP.is_set():
                 break
             url = f"{BASE_URL}/discussions/{self.provider}/{page_num}"
             resp = self._fetch_with_session(session, url)
@@ -727,23 +774,19 @@ class ExamTopicsScraper:
             if not resp:
                 with self._progress_lock:
                     self._failed_pages.append(page_num)
-            if resp:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                found = self._extract_exam_links(soup, any_exam=True)
-                results.update(found)
-                if found:
-                    with self._progress_lock:
-                        self._urls_found += len(found)
+                continue
+            found = self._extract_exam_links(BeautifulSoup(resp.text, "html.parser"), any_exam=True)
+            with self._progress_lock:
+                self._index_state["urls"].update(found)
+                self._index_state["done"].add(page_num)
+                self._urls_found = len(self._index_state["urls"])
+                save = len(self._index_state["done"]) % 20 == 0
+            if save:
+                self._save_index(False)
 
             if page_num % 100 == 0:
-                with self._progress_lock:
-                    logger.info(
-                        f"  Page {page_num}/{max_pages}: "
-                        f"{self._urls_found} URLs found so far..."
-                    )
-
-
-        return results
+                logger.info(f"  Page {page_num}/{max_pages}: "
+                            f"{self._urls_found} URLs found so far...")
 
     def _extract_exam_links(self, soup: BeautifulSoup, any_exam: bool = False) -> set[str]:
         """
@@ -799,7 +842,7 @@ class ExamTopicsScraper:
         total = len(urls)
         self._questions_scraped = 0
 
-        with ThreadPoolExecutor(max_workers=DISC_WORKERS) as executor:
+        with _pool(DISC_WORKERS) as executor:
             futures = {
                 executor.submit(self._scrape_one_discussion, url): url
                 for url in urls
@@ -1442,14 +1485,14 @@ class ExamTopicsScraper:
             slot = max(now, _PACER.next_slot)
             _PACER.next_slot = slot + _PACER.interval
         if slot > now:
-            time.sleep(slot - now)
+            _sleep(slot - now)
 
     def _backoff(self, seconds: float):
         """Slow everyone down after a 429/challenge, then pause this thread."""
         with _PACER.lock:
             _PACER.interval = min(_PACER.interval * 2, MAX_INTERVAL)
             _PACER.next_slot = max(_PACER.next_slot, time.monotonic() + seconds)
-        time.sleep(seconds)
+        _sleep(seconds)
 
     def _blocked(self):
         """Retries exhausted on 429/challenge: stop every thread and remember a cool-down."""
@@ -1470,7 +1513,7 @@ class ExamTopicsScraper:
     ) -> requests.Response | None:
         refused = False
         for attempt in range(retries):
-            if _PACER.blocked:
+            if _PACER.blocked or _STOP.is_set():
                 return None
             self._throttle()
             try:
@@ -1502,7 +1545,7 @@ class ExamTopicsScraper:
             except requests.RequestException as e:
                 wait = 2 ** (attempt + 1)
                 logger.error(f"  Request error ({url}): {e}")
-                time.sleep(wait)
+                _sleep(wait)
         if refused:
             self._blocked()
         return None
