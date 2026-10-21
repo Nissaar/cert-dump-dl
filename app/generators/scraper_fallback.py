@@ -84,6 +84,7 @@ class _Pacer:
         self.interval = BASE_INTERVAL
         self.next_slot = 0.0
         self.blocked = False
+        self.ok = 0  # successful requests, to save the pace now and then
 
 
 _PACER = _Pacer()
@@ -189,6 +190,7 @@ class ExamTopicsScraper:
             raise RateLimitedError(f"ExamTopics blocked an earlier run: cooling down {left // 60} more minutes")
         _PACER.blocked = False
         _STOP.clear()
+        self._load_pace()
 
         # ── Phase 1 ──
         logger.info("Phase 1: Fetching exam overview...")
@@ -1541,7 +1543,35 @@ class ExamTopicsScraper:
         with _PACER.lock:
             _PACER.interval = min(_PACER.interval * 2, MAX_INTERVAL)
             _PACER.next_slot = max(_PACER.next_slot, time.monotonic() + seconds)
+        self._save_pace()
         _sleep(seconds)
+
+    # The pace the site accepts is kept in state_dir, so the next exam (a new process when
+    # crawling one exam per container) starts at that pace instead of at full speed.
+    def _pace_path(self):
+        return os.path.join(self.state_dir, "pace.json") if self.state_dir else None
+
+    def _load_pace(self):
+        try:
+            with open(self._pace_path(), encoding="utf-8") as f:
+                d = json.load(f)
+            if time.time() - float(d["time"]) < INDEX_MAX_AGE:
+                with _PACER.lock:
+                    _PACER.interval = min(MAX_INTERVAL, max(_PACER.interval, BASE_INTERVAL, float(d["interval"])))
+                logger.info(f"  Pace from earlier runs: one request every {_PACER.interval:.1f}s")
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def _save_pace(self):
+        path = self._pace_path()
+        if not path:
+            return
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"interval": _PACER.interval, "time": time.time()}, f)
+        except OSError:
+            pass
 
     def _blocked(self):
         """Retries exhausted on 429/challenge: stop every thread and remember a cool-down."""
@@ -1577,6 +1607,10 @@ class ExamTopicsScraper:
                 if resp.status_code == 200:
                     with _PACER.lock:  # recover speed slowly after throttling
                         _PACER.interval = max(BASE_INTERVAL, _PACER.interval * 0.99)
+                        _PACER.ok += 1
+                        save = _PACER.ok % 25 == 0
+                    if save:
+                        self._save_pace()
                     return resp
                 if resp.status_code in (429, 500, 502, 503, 504):
                     refused = resp.status_code == 429
