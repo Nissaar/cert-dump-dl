@@ -368,16 +368,21 @@ class ExamTopicsScraper:
                f"&matchType=prefix&filter=original:.*{re.escape(self.exam_code)}.*"
                f"&collapse=urlkey&output=json&limit=200000{extra}")
         session = self._make_session()
-        for attempt in range(4):
+        for attempt in range(5):
+            wait = min(30 * 2 ** attempt, 600)  # archive.org rate-limits too: 30 s … 10 min
             try:
                 resp = session.get(url, timeout=180)
                 if resp.status_code == 200:
                     rows = resp.json() if resp.text.strip() else []
                     return rows[1:]  # first row is the header
-                logger.warning(f"  Archive CDX HTTP {resp.status_code}, retrying...")
+                retry_after = resp.headers.get("Retry-After", "")
+                if retry_after.isdigit():
+                    wait = min(int(retry_after), 1800)
+                logger.warning(f"  Archive CDX HTTP {resp.status_code} → pausing {wait}s...")
             except (requests.RequestException, ValueError) as e:
-                logger.warning(f"  Archive CDX error: {e}")
-            time.sleep(10 * (attempt + 1))
+                logger.warning(f"  Archive CDX error: {e} → pausing {wait}s...")
+            time.sleep(wait)
+        logger.warning("  Archive CDX unavailable: continuing with the live index only")
         return []
 
     def _discover_from_archive(self) -> list[str]:
