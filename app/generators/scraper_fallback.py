@@ -810,7 +810,7 @@ class ExamTopicsScraper:
 
         if self._failed_pages:
             logger.warning(f"  ⚠ {len(self._failed_pages)} index pages could not be fetched "
-                           f"(rate limited) — the next run retries just those")
+                           f"(rate limited, 404 or network errors) — the next run retries just those")
         return sorted(self._index_state["urls"]), complete
 
     def _crawl_index_batch(self, pages: list[int], max_pages: int) -> None:
@@ -819,7 +819,7 @@ class ExamTopicsScraper:
         for page_num in pages:
             if _PACER.blocked or _STOP.is_set():
                 break
-            url = f"{BASE_URL}/discussions/{self.provider}/{page_num}"
+            url = f"{BASE_URL}/discussions/{self.provider}/{page_num}/"  # without the slash the site answers 404
             resp = self._fetch_with_session(session, url)
 
             if not resp:
