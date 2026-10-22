@@ -289,8 +289,21 @@ def answer_letters(answer: str) -> list[str]:
     return sorted(set(re.findall(r"[A-H]", s)))
 
 
+def profile_key(exam_code: str) -> str:
+    """The profile for an exam code. The site's long names count too:
+    'aws-certified-solutions-architect-associate-saa-c03' -> 'saa-c03'."""
+    code = (exam_code or "").lower()
+    if code in PROFILES:
+        return code
+    for key in PROFILES:
+        if code.endswith("-" + key):
+            return key
+    return code
+
+
 def classify(q: dict, exam_code: str, provider: str) -> dict:
     """Set q['topic_tags'] (list) and q['domain'] (str or '')."""
+    exam_code = profile_key(exam_code)
     topics_map, domains, fallback = PROFILES.get(
         exam_code, (PROVIDER_TOPICS.get(provider, {}), [], None)
     )
